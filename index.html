@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>Tryout Evaluator</title>
 
+<!-- ── REPLACE THIS BLOCK WITH YOUR FIREBASE CONFIG ── -->
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
   import { getFirestore, doc, setDoc, getDoc, onSnapshot, collection, getDocs, deleteDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
@@ -17,52 +18,15 @@
     messagingSenderId: "851377690492",
     appId: "1:851377690492:web:da90235338b336e7c536f9"
   };
+<!-- ── END FIREBASE CONFIG BLOCK ── -->
 
   const app = initializeApp(firebaseConfig);
   const db = getFirestore(app);
 
   // ── State ────────────────────────────────────────────────────────────────
-  // Scored skills (1-10)
-  const SKILLS = ['Hitting Contact','Hitting Power','Infield','Outfield','Pitching','Arm Strength','Catching'];
-  const SK      = ['hitContact','hitPower','infield','outfield','pitching','arm','catching'];
-
-  // Weights for overall score (used proportionally — unscored skills are excluded)
-  const WEIGHTS = {
-    hitContact: 0.15,
-    hitPower:   0.15,
-    infield:    0.15,
-    outfield:   0.15,
-    pitching:   0.20,
-    arm:        0.10,
-    catching:   0.10,
-  };
-
-  // Raw measurement fields — values stored as arrays (multiple readings allowed)
-  // scores[pid][cid][key] = [] array of number strings
-  const MEAS_FIELDS = [
-    { key: 'speed30',   label: 'Home to 1st (30 yd)',  unit: 'sec',  timer: true  },
-    { key: 'speed60',   label: 'Home to 2nd (60 yd)',  unit: 'sec',  timer: true  },
-    { key: 'pitchVelo', label: 'Fastball Velocity',    unit: 'mph',  timer: false },
-    { key: 'popTime',   label: 'Catching Pop Time',    unit: 'sec',  timer: true  },
-  ];
-
-  // Timer state per measurement key
-  const timerState = {};
-
-  // Keypad state for manual entry
-  let keypadState = { pid: null, key: null, buffer: '' };
+  const SKILLS = ['Hitting','Pitching','Fielding','Arm Strength','Speed','Catching','Instincts'];
+  const SK     = ['hitting','pitching','fielding','arm','speed','catching','instincts'];
   const PALETTE = ['#c8102e','#1565c0','#2e7d32','#6a1b9a','#e65100','#00695c','#bf360c'];
-
-  const AGE_GROUPS = ['7U','8U','9U','10U','11U','12U','13U','14U','15U','16U','17U','18U'];
-
-  function normalizeAge(raw) {
-    if (!raw) return '';
-    const n = raw.toString().replace(/[^0-9]/g,'');
-    if (!n) return raw;
-    const num = parseInt(n);
-    if (num >= 7 && num <= 18) return num + 'U';
-    return raw;
-  }
 
   let coaches  = [];
   let players  = [];
@@ -80,20 +44,11 @@
       const cSnap = await getDocs(collection(db, 'coaches'));
       coaches = [];
       cSnap.forEach(d => coaches.push({ id: d.id, ...d.data() }));
-      const expectedNames = ['Wes Borden','Nic Robinson','Jack Hall','Other'];
-      const hasCorrectCoaches = coaches.length === 4 && expectedNames.every(n => coaches.some(c => c.name === n));
-
-      if (!hasCorrectCoaches) {
-        // Wipe existing coaches and re-seed with correct names
-        for (const c of coaches) {
-          try { await deleteDoc(doc(db, 'coaches', c.id)); } catch(e){}
-        }
-        coaches = [];
+      if (!coaches.length) {
         const defaults = [
-          { name: 'Wes Borden',   color: '#c8102e' },
-          { name: 'Nic Robinson', color: '#1565c0' },
-          { name: 'Jack Hall',    color: '#2e7d32' },
-          { name: 'Other',        color: '#6a1b9a' },
+          { name: 'Coach Rivera',   color: '#c8102e' },
+          { name: 'Coach Thompson', color: '#1565c0' },
+          { name: 'Coach Davis',    color: '#2e7d32' },
         ];
         for (const c of defaults) {
           const id = 'c' + Date.now() + Math.random().toString(36).slice(-4);
@@ -223,8 +178,9 @@
     const id = newId('c');
     const color = PALETTE[coaches.length % PALETTE.length];
     await setDoc(doc(db, 'coaches', id), { name, color });
-    // Don't push locally — onSnapshot listener handles it
+    coaches.push({ id, name, color });
     inp.value = '';
+    renderLogin();
   };
 
   window.loginAs = function(id) {
@@ -248,31 +204,6 @@
     f.style.display = f.style.display === 'none' ? 'block' : 'none';
   };
 
-  let addPhotoBase64 = null;
-  let editPhotoBase64 = null;
-
-  window.previewEditPhoto = function(e) {
-    const file = e.target.files[0]; if (!file) return;
-    const reader = new FileReader();
-    reader.onload = ev => {
-      editPhotoBase64 = ev.target.result;
-      const prev = document.getElementById('edit-photo-preview');
-      if (prev) prev.innerHTML = `<img src="${ev.target.result}" style="width:100%;height:100%;object-fit:cover">`;
-    };
-    reader.readAsDataURL(file);
-  };
-
-  window.previewAddPhoto = function(e) {
-    const file = e.target.files[0]; if (!file) return;
-    const reader = new FileReader();
-    reader.onload = ev => {
-      addPhotoBase64 = ev.target.result;
-      const prev = document.getElementById('add-photo-preview');
-      if (prev) prev.innerHTML = `<img src="${ev.target.result}" style="width:100%;height:100%;object-fit:cover">`;
-    };
-    reader.readAsDataURL(file);
-  };
-
   window.addPlayer = async function() {
     const first = document.getElementById('ff').value.trim();
     const last  = document.getElementById('fl').value.trim();
@@ -280,24 +211,19 @@
     const id = newId('p');
     const data = {
       first, last,
-      age:   normalizeAge(document.getElementById('fa').value.trim()),
-      num:   document.getElementById('fg2').value.trim(),
+      age:   document.getElementById('fa').value.trim(),
+      num:   document.getElementById('fn').value.trim(),
       pos:   document.getElementById('fp').value,
-      pos2:  document.getElementById('fp2').value,
-      photo: addPhotoBase64 || '',
-      group: '',
-      notes: '',
+      group: document.getElementById('fg2').value.trim(),
+      notes: document.getElementById('fno').value.trim(),
       createdAt: Date.now()
     };
     await setDoc(doc(db, 'players', id), data);
-    // Don't push locally — onSnapshot listener will add it and re-render
-    ['ff','fl','fa','fn','fg2'].forEach(x => { const el=document.getElementById(x); if(el) el.value=''; });
+    players.push({ id, ...data });
+    ['ff','fl','fa','fn','fg2','fno'].forEach(x => document.getElementById(x).value = '');
     document.getElementById('fp').value = '';
-    document.getElementById('fp2').value = '';
-    addPhotoBase64 = null;
-    const prev = document.getElementById('add-photo-preview');
-    if (prev) prev.innerHTML = '📷';
     toggleAddForm();
+    renderRoster();
   };
 
   window.removePlayer = async function(id) {
@@ -310,71 +236,6 @@
     players = players.filter(p => p.id !== id);
     delete scores[id];
     renderRoster();
-  };
-
-  window.openEditPlayer = function(pid) {
-    const p = players.find(x => x.id === pid);
-    if (!p) return;
-    editPhotoBase64 = null;
-    const posOpts = ['','Pitcher','Catcher','1B','2B','3B','SS','LF','CF','RF','Utility','Unknown'];
-    const selOpt = (val) => posOpts.map(o => `<option value="${o}" ${o===val?'selected':''}>${o||'Select...'}</option>`).join('');
-    document.getElementById('edit-modal-body').innerHTML = `
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
-        <div style="font-size:16px;font-weight:600;color:var(--txt)">Edit Player</div>
-        <button class="btn sm del" onclick="closeEditModal()" style="font-size:16px;padding:2px 8px">✕</button>
-      </div>
-      <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
-        <div id="edit-photo-preview" style="width:72px;height:72px;border-radius:var(--radius);overflow:hidden;border:0.5px solid var(--bdr2);cursor:pointer;display:flex;align-items:center;justify-content:center;background:var(--bg2);font-size:28px" onclick="document.getElementById('edit-photo-inp').click()">
-          ${p.photo ? `<img src="${p.photo}" style="width:100%;height:100%;object-fit:cover">` : '📷'}
-        </div>
-        <div style="font-size:12px;color:var(--txt2)">Tap photo to change</div>
-        <input type="file" id="edit-photo-inp" accept="image/*" capture="environment" style="display:none" onchange="previewEditPhoto(event)">
-      </div>
-      <div class="frow c4" style="margin-bottom:8px">
-        <div class="fg"><label>First name</label><input id="ef-first" type="text" value="${p.first}"></div>
-        <div class="fg"><label>Last name</label><input id="ef-last" type="text" value="${p.last}"></div>
-        <div class="fg"><label>Age group</label>
-          <select id="ef-age" style="width:100%;padding:6px 8px;font-size:13px;border:0.5px solid var(--bdr2);border-radius:var(--radius-sm);background:var(--bg);color:var(--txt)">
-            <option value="">Select...</option>
-            ${ ['7U','8U','9U','10U','11U','12U','13U','14U','15U','16U','17U','18U'].map(a=>'<option value="'+a+'"'+(normalizeAge(p.age||'')===a?' selected':'')+'>'+a+'</option>').join('') }
-          </select>
-        </div>
-        <div class="fg"><label>Tryout #</label><input id="ef-num" type="text" value="${p.num||''}"></div>
-      </div>
-      <div class="frow c4" style="margin-bottom:16px">
-        <div class="fg"><label>Primary position</label><select id="ef-pos">${selOpt(p.pos||'')}</select></div>
-        <div class="fg"><label>Secondary position</label><select id="ef-pos2">${selOpt(p.pos2||'')}</select></div>
-      </div>
-      <div style="display:flex;gap:8px;justify-content:flex-end">
-        <button class="btn" onclick="closeEditModal()">Cancel</button>
-        <button class="btn pri" onclick="saveEditPlayer('${pid}')">Save changes</button>
-      </div>`;
-    document.getElementById('edit-modal-overlay').style.display = 'flex';
-  };
-
-  window.closeEditModal = function() {
-    document.getElementById('edit-modal-overlay').style.display = 'none';
-  };
-
-  window.saveEditPlayer = async function(pid) {
-    const p = players.find(x => x.id === pid);
-    if (!p) return;
-    const first = document.getElementById('ef-first').value.trim();
-    const last  = document.getElementById('ef-last').value.trim();
-    if (!first || !last) { alert('Name required'); return; }
-    const updates = {
-      first, last,
-      age:  normalizeAge(document.getElementById('ef-age').value.trim()),
-      num:  document.getElementById('ef-num').value.trim(),
-      pos:  document.getElementById('ef-pos').value,
-      pos2: document.getElementById('ef-pos2').value,
-      photo: editPhotoBase64 !== null ? editPhotoBase64 : (p.photo || ''),
-    };
-    Object.assign(p, updates);
-    await setDoc(doc(db, 'players', pid), { ...p });
-    closeEditModal();
-    renderRoster();
-    flashSave();
   };
 
   window.importCSV = function(e) {
@@ -396,7 +257,7 @@
         const id = newId('p');
         const data = {
           first, last,
-          age:   normalizeAge(get(row, ['age','gradyear','grad'])),
+          age:   get(row, ['age','gradyear','grad']),
           num:   get(row, ['number','num','jersey','jerseynumber']),
           pos:   get(row, ['position','pos']),
           group: get(row, ['group','team','division']),
@@ -404,55 +265,29 @@
           createdAt: Date.now()
         };
         await setDoc(doc(db, 'players', id), data);
+        players.push({ id, ...data });
         n++;
       }
       e.target.value = '';
-      alert(`Imported ${n} player${n !== 1 ? 's' : ''}. Roster will update shortly.`);
+      renderRoster();
+      alert(`Imported ${n} player${n !== 1 ? 's' : ''}.`);
     };
     reader.readAsText(file);
   };
 
-  function populateAgeDropdown(selectId) {
-    const sel = document.getElementById(selectId);
-    if (!sel) return;
-    const current = sel.value;
-    const ages = [...new Set(players.map(p => p.age).filter(Boolean))].sort();
-    sel.innerHTML = '<option value="">All ages</option>' + ages.map(a => `<option value="${a}" ${a===current?'selected':''}>${a}</option>`).join('');
-  }
-
-  function applyListFiltersAndSort(players, searchId, ageId, sortId) {
-    const q = (document.getElementById(searchId)?.value || '').toLowerCase();
-    const age = document.getElementById(ageId)?.value || '';
-    const sort = document.getElementById(sortId)?.value || 'name';
-    let list = players.filter(p => {
-      const matchQ = `${p.first} ${p.last} ${p.num} ${p.pos}`.toLowerCase().includes(q);
-      const matchAge = !age || p.age === age;
-      return matchQ && matchAge;
-    });
-    if (sort === 'tryout') list.sort((a,b) => (parseInt(a.num)||999) - (parseInt(b.num)||999));
-    else if (sort === 'age') list.sort((a,b) => (a.age||'').localeCompare(b.age||''));
-    else list.sort((a,b) => `${a.last}${a.first}`.localeCompare(`${b.last}${b.first}`));
-    return list;
-  }
-
   function renderRoster() {
-    populateAgeDropdown('r-age');
+    const q = (document.getElementById('r-srch').value || '').toLowerCase();
     const el = document.getElementById('roster-list');
-    const list = applyListFiltersAndSort(players, 'r-srch', 'r-age', 'r-sort');
-    if (!list.length) { el.innerHTML = '<p class="empty">No players match. Try clearing the filters.</p>'; return; }
+    const list = players.filter(p => `${p.first} ${p.last} ${p.num} ${p.pos} ${p.group}`.toLowerCase().includes(q));
+    if (!list.length) { el.innerHTML = '<p class="empty">No players yet — import a CSV or add manually.</p>'; return; }
     el.innerHTML = list.map(p => {
       const myScored = activeCoach && scores[p.id] && scores[p.id][activeCoach.id] && SK.some(k => scores[p.id][activeCoach.id][k]);
       const coachCount = coaches.filter(c => scores[p.id] && scores[p.id][c.id] && SK.some(k => scores[p.id][c.id][k])).length;
-      const posDisplay = [p.pos, p.pos2].filter(Boolean).join(' / ');
-      const photoHtml = p.photo
-        ? `<img src="${p.photo}" style="width:36px;height:36px;border-radius:50%;object-fit:cover;border:0.5px solid var(--bdr);flex-shrink:0">`
-        : `<div style="width:36px;height:36px;border-radius:50%;background:var(--bg2);border:0.5px solid var(--bdr);display:flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0">${p.first[0]}${p.last[0]}</div>`;
-      return `<div class="prow" style="cursor:pointer;grid-template-columns:36px 36px 1fr auto auto auto" onclick="openEditPlayer('${p.id}')">
+      return `<div class="prow">
         <div class="pnum">${p.num || '—'}</div>
-        ${photoHtml}
         <div>
           <div class="pname">${p.first} ${p.last}</div>
-          <div class="pmeta">${posDisplay || '—'} · ${p.age || '—'}</div>
+          <div class="pmeta">${p.pos || '—'} · ${p.group || '—'}</div>
         </div>
         <div class="pbadges">
           ${myScored ? '<span class="badge bgn">Scored by me</span>' : '<span class="badge bgr">Pending</span>'}
@@ -460,7 +295,8 @@
         </div>
         <div class="pavg">${aggAvg(p.id)}</div>
         <div class="pactions">
-          <button class="btn sm del" onclick="event.stopPropagation();removePlayer('${p.id}')">✕</button>
+          <button class="btn pri sm" onclick="openEval('${p.id}')">Evaluate</button>
+          <button class="btn sm del" onclick="removePlayer('${p.id}')">✕</button>
         </div>
       </div>`;
     }).join('');
@@ -468,10 +304,10 @@
 
   // ── Eval picker ──────────────────────────────────────────────────────────
   function renderEvalPicker() {
-    populateAgeDropdown('ep-age');
+    const q      = (document.getElementById('ep-srch').value || '').toLowerCase();
     const filter = document.getElementById('ep-filter').value;
     const el     = document.getElementById('eval-list');
-    let list = applyListFiltersAndSort(players, 'ep-srch', 'ep-age', 'ep-sort');
+    let list = players.filter(p => `${p.first} ${p.last} ${p.pos}`.toLowerCase().includes(q));
     if (filter === 'pending') list = list.filter(p => !activeCoach || !scores[p.id] || !scores[p.id][activeCoach.id] || !SK.some(k => scores[p.id][activeCoach.id][k]));
     if (filter === 'done')    list = list.filter(p => activeCoach && scores[p.id] && scores[p.id][activeCoach.id] && SK.some(k => scores[p.id][activeCoach.id][k]));
     if (!list.length) { el.innerHTML = '<p class="empty">No players match.</p>'; return; }
@@ -491,52 +327,16 @@
     currentEvalPid = pid;
     document.getElementById('eval-picker').style.display = 'none';
     document.getElementById('eval-form-wrap').style.display = 'block';
-    document.getElementById('eval-sidebar').style.display = 'block';
-    renderSidebar();
     renderEvalForm();
   };
-
-  function renderSidebar() {
-    const ageFilter = document.getElementById('ep-age')?.value || '';
-    const sidebar = document.getElementById('sidebar-list');
-    const label = document.getElementById('sidebar-age-label');
-    if (label) label.textContent = ageFilter ? ageFilter + ' Players' : 'All Players';
-    let list = ageFilter ? players.filter(p => p.age === ageFilter) : players;
-    list = [...list].sort((a,b) => (parseInt(a.num)||999)-(parseInt(b.num)||999));
-    if (!sidebar) return;
-    sidebar.innerHTML = list.map(p => {
-      const isCurrent = p.id === currentEvalPid;
-      const myScored = activeCoach && scores[p.id] && scores[p.id][activeCoach.id] && SK.some(k => scores[p.id][activeCoach.id][k]);
-      return `<div onclick="openEval('${p.id}')" style="padding:8px 12px;cursor:pointer;border-bottom:0.5px solid var(--bdr);background:${isCurrent?'var(--red)':'var(--bg)'};transition:background .1s">
-        <div style="font-size:13px;font-weight:600;color:${isCurrent?'#fff':'var(--txt)'}">#${p.num||'—'} ${p.first} ${p.last}</div>
-        <div style="font-size:11px;color:${isCurrent?'rgba(255,255,255,0.8)':'var(--txt2)'};">${p.pos||'—'} ${myScored?'✓':''}</div>
-      </div>`;
-    }).join('');
-    // Scroll active player into view
-    const active = sidebar.querySelector(`div[style*="var(--red)"]`);
-    if (active) active.scrollIntoView({block:'nearest'});
-  }
 
   window.closeEval = function() {
     document.getElementById('eval-picker').style.display = 'block';
     document.getElementById('eval-form-wrap').style.display = 'none';
-    document.getElementById('eval-sidebar').style.display = 'none';
     renderEvalPicker();
   };
 
   // ── Eval form ────────────────────────────────────────────────────────────
-  function myWeightedAvg(cs) {
-    let wsum = 0, wused = 0;
-    SK.forEach(k => {
-      const v = cs[k];
-      if (!v) return; // skip unscored
-      const w = WEIGHTS[k] || (1/SK.length);
-      wsum += v * w; wused += w;
-    });
-    // Re-normalize by wused so unscored skills don't drag score down
-    return wused ? (wsum / wused).toFixed(1) : '—';
-  }
-
   function renderEvalForm() {
     const p = players.find(x => x.id === currentEvalPid);
     if (!p || !activeCoach) return;
@@ -544,6 +344,11 @@
     if (!scores[p.id][activeCoach.id]) scores[p.id][activeCoach.id] = {};
     const cs = scores[p.id][activeCoach.id];
     const idx = players.indexOf(p);
+
+    const myAvgVal = () => {
+      const v = SK.map(k => cs[k] || 0).filter(v => v > 0);
+      return v.length ? (v.reduce((a,b) => a+b,0) / v.length).toFixed(1) : '—';
+    };
 
     const scoreRow = (key, label) => {
       const val = cs[key] || 0;
@@ -556,48 +361,18 @@
       </div>`;
     };
 
-    const measRow = (m) => {
-      const readings = getMeasReadings(p.id, m.key);
-      const nums = readings.map(r => parseFloat(r)).filter(n => !isNaN(n));
-      const avg = nums.length ? (nums.reduce((a,b)=>a+b,0)/nums.length).toFixed(2) : null;
-      const readingsList = readings.length ? readings.map((r,i) =>
-        `<div class="mread-row"><span class="mread-val">${parseFloat(r).toFixed(2)}</span><button class="mread-del" onclick="deleteMeasReading('${p.id}','${m.key}',${i})">✕</button></div>`
-      ).join('') : '<span style="font-size:12px;color:var(--txt3)">No readings yet</span>';
-      const avgText = nums.length ? `Avg: ${avg} (${nums.length} reading${nums.length>1?'s':''})` : '';
-
-      if (m.timer) {
-        const ts = timerState[m.key] || {};
-        const isRunning = ts.running || false;
-        return `<div class="meas-item">
-          <div class="slbl">${m.label} <span style="font-size:11px;color:var(--txt3)">${m.unit}</span></div>
-          <div class="timer-display" id="td-${m.key}">0.00s</div>
-          <div class="timer-btns">
-            <button class="timer-btn ${isRunning?'timer-stop':'timer-start'}" id="tb-${m.key}" onclick="timerToggle('${p.id}','${m.key}')">${isRunning?'⏹ Stop':'▶ Start'}</button>
-          </div>
-          <div id="mrl-${m.key}" class="mread-list">${readingsList}</div>
-          <div id="mra-${m.key}" class="mread-avg">${avgText}</div>
-        </div>`;
-      }
-      return `<div class="meas-item">
-        <div class="slbl">${m.label} <span style="font-size:11px;color:var(--txt3)">${m.unit}</span></div>
-        <button class="timer-btn timer-start" style="margin-bottom:6px" onclick="openKeypad('${p.id}','${m.key}','${m.label}')">+ Add reading</button>
-        <div id="mrl-${m.key}" class="mread-list">${readingsList}</div>
-        <div id="mra-${m.key}" class="mread-avg">${avgText}</div>
-      </div>`;
-    };
-
     const others = coaches.filter(c => c.id !== activeCoach.id && scores[p.id] && scores[p.id][c.id] && SK.some(k => scores[p.id][c.id][k]));
     const othersHTML = others.length ? `
       <hr class="divider">
       <div class="other-title">Other coaches' scores</div>
       ${others.map(c => {
         const sc = scores[p.id][c.id];
-        const cavg = myWeightedAvg(sc);
+        const cv = SK.map(k => sc[k] || 0).filter(v => v > 0);
+        const cavg = cv.length ? (cv.reduce((a,b) => a+b,0)/cv.length).toFixed(1) : '—';
         const pills = SK.map((k,i) => sc[k] ? `<span class="cpill" style="background:${c.color}18;color:${c.color}">${SKILLS[i].split(' ')[0]}: ${sc[k]}</span>` : '').filter(Boolean).join('');
-        const measPills = MEAS_FIELDS.map(m => sc[m.key] ? `<span class="cpill" style="background:#88888818;color:var(--txt2)">${m.label.split(' ')[0]}: ${sc[m.key]}${m.unit}</span>` : '').filter(Boolean).join('');
         return `<div class="other-row">
           <span class="other-name" style="color:${c.color}">${c.name} <span class="other-avg">(${cavg})</span></span>
-          <div class="other-pills">${pills}${measPills}</div>
+          <div class="other-pills">${pills}</div>
         </div>`;
       }).join('')}` : '';
 
@@ -605,32 +380,19 @@
       <div class="eval-card">
         <div class="eval-hdr">
           <div>
-            <div style="display:flex;align-items:center;gap:10px">
-          ${p.photo ? `<img src="${p.photo}" style="width:48px;height:48px;border-radius:50%;object-fit:cover;border:0.5px solid var(--bdr)">` : `<div style="width:48px;height:48px;border-radius:50%;background:var(--bg2);border:0.5px solid var(--bdr);display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:600;color:var(--txt2)">${p.first[0]}${p.last[0]}</div>`}
-          <div class="eval-pname">${p.first} ${p.last}</div>
-        </div>
-            <div class="eval-meta">Tryout #${p.num||'—'} · ${p.pos||'—'} · ${p.age||'—'}</div>
+            <div class="eval-pname">${p.first} ${p.last}</div>
+            <div class="eval-meta">#${p.num||'—'} · ${p.pos||'—'} · Age ${p.age||'—'} · ${p.group||'—'}</div>
             <div class="eval-coach-lbl" style="color:${activeCoach.color}">Scoring as ${activeCoach.name}</div>
           </div>
           <div class="eval-avg-block">
-            <div class="eval-avg-num" id="my-avg">${myWeightedAvg(cs)}</div>
-            <div class="eval-avg-sub">my weighted score</div>
+            <div class="eval-avg-num" id="my-avg">${myAvgVal()}</div>
+            <div class="eval-avg-sub">my avg / 10</div>
             <div class="eval-avg-sub" style="margin-top:2px">all coaches: ${aggAvg(p.id)}</div>
           </div>
         </div>
-
-        <div style="font-size:11px;font-weight:600;color:var(--txt2);margin-bottom:8px;text-transform:uppercase;letter-spacing:.5px">Skill Scores</div>
         <div class="skill-grid">
           ${SK.map((k,i) => scoreRow(k, SKILLS[i])).join('')}
         </div>
-
-        <hr class="divider">
-        <div style="font-size:11px;font-weight:600;color:var(--txt2);margin-bottom:8px;text-transform:uppercase;letter-spacing:.5px">Measurements</div>
-        <div class="meas-grid">
-          ${MEAS_FIELDS.map(m => measRow(m)).join('')}
-        </div>
-
-        <hr class="divider">
         <div class="notes-wrap">
           <label class="notes-lbl">My notes for ${p.first}</label>
           <textarea id="my-notes" class="notes-ta" onchange="saveNotesNow('${p.id}')" onblur="saveNotesNow('${p.id}')" placeholder="Mechanics, attitude, standout moments...">${cs.notes || ''}</textarea>
@@ -650,166 +412,27 @@
     if (!activeCoach) return;
     if (!scores[pid]) scores[pid] = {};
     if (!scores[pid][activeCoach.id]) scores[pid][activeCoach.id] = {};
-
-    // Toggle off if same button clicked again
-    const current = scores[pid][activeCoach.id][key];
-    const newVal = (current === val) ? null : val;
-    scores[pid][activeCoach.id][key] = newVal;
+    scores[pid][activeCoach.id][key] = val;
 
     // Update buttons
     const kidx = SK.indexOf(key);
     const allTracks = document.querySelectorAll('.strack');
     if (allTracks[kidx]) {
       allTracks[kidx].querySelectorAll('.sc').forEach((sc,i) => {
-        sc.classList.toggle('on', newVal && i < newVal);
+        sc.classList.toggle('on', i < val);
       });
     }
     const svEl = document.getElementById('sv-' + key);
-    if (svEl) svEl.textContent = newVal ? newVal + '/10' : '—';
+    if (svEl) svEl.textContent = val + '/10';
 
-    // Update my weighted avg display
+    // Update my avg
     const cs = scores[pid][activeCoach.id];
+    const vals = SK.map(k => cs[k] || 0).filter(v => v > 0);
+    const avg = vals.length ? (vals.reduce((a,b) => a+b,0)/vals.length).toFixed(1) : '—';
     const avgEl = document.getElementById('my-avg');
-    if (avgEl) avgEl.textContent = myWeightedAvg(cs);
+    if (avgEl) avgEl.textContent = avg;
 
     scheduleSave(pid, activeCoach.id);
-    if (document.getElementById('eval-sidebar').style.display !== 'none') renderSidebar();
-  };
-
-  window.setMeas = function(pid, key, val) {
-    if (!activeCoach) return;
-    if (!scores[pid]) scores[pid] = {};
-    if (!scores[pid][activeCoach.id]) scores[pid][activeCoach.id] = {};
-    scores[pid][activeCoach.id][key] = val;
-    scheduleSave(pid, activeCoach.id);
-  };
-
-  // ── Timer + multi-reading system ─────────────────────────────────────────
-  let timerRAF = {};
-
-  function getMeasReadings(pid, key) {
-    if (!activeCoach || !scores[pid] || !scores[pid][activeCoach.id]) return [];
-    const val = scores[pid][activeCoach.id][key];
-    if (!val) return [];
-    if (Array.isArray(val)) return val;
-    if (typeof val === 'string' && val !== '') return [val]; // legacy single
-    return [];
-  }
-
-  function saveMeasReadings(pid, key, readings) {
-    if (!activeCoach) return;
-    if (!scores[pid]) scores[pid] = {};
-    if (!scores[pid][activeCoach.id]) scores[pid][activeCoach.id] = {};
-    scores[pid][activeCoach.id][key] = readings;
-    scheduleSave(pid, activeCoach.id);
-  }
-
-  function refreshMeasUI(pid, key) {
-    const readings = getMeasReadings(pid, key);
-    const listEl = document.getElementById('mrl-' + key);
-    const avgEl  = document.getElementById('mra-' + key);
-    if (listEl) {
-      listEl.innerHTML = readings.length ? readings.map((r,i) =>
-        `<div class="mread-row">
-          <span class="mread-val">${parseFloat(r).toFixed(2)}</span>
-          <button class="mread-del" onclick="deleteMeasReading('${pid}','${key}',${i})">✕</button>
-        </div>`
-      ).join('') : '<span style="font-size:12px;color:var(--txt3)">No readings yet</span>';
-    }
-    if (avgEl) {
-      if (readings.length) {
-        const nums = readings.map(r => parseFloat(r)).filter(n => !isNaN(n));
-        const avg = nums.length ? (nums.reduce((a,b)=>a+b,0)/nums.length).toFixed(2) : '—';
-        avgEl.textContent = `Avg: ${avg} (${readings.length} reading${readings.length>1?'s':''})`;
-      } else {
-        avgEl.textContent = '';
-      }
-    }
-  }
-
-  window.deleteMeasReading = function(pid, key, idx) {
-    const readings = [...getMeasReadings(pid, key)];
-    readings.splice(idx, 1);
-    saveMeasReadings(pid, key, readings);
-    refreshMeasUI(pid, key);
-  };
-
-  window.timerToggle = function(pid, key) {
-    if (!timerState[key]) timerState[key] = { running: false, start: null };
-    const ts = timerState[key];
-    if (ts.running) {
-      const elapsed = Date.now() - ts.start;
-      ts.running = false;
-      cancelAnimationFrame(timerRAF[key]);
-      const secs = (elapsed / 1000).toFixed(2);
-      const readings = [...getMeasReadings(pid, key), secs];
-      saveMeasReadings(pid, key, readings);
-      const disp = document.getElementById('td-' + key);
-      if (disp) disp.textContent = secs + 's';
-      const btn = document.getElementById('tb-' + key);
-      if (btn) { btn.textContent = '▶ Start'; btn.className = 'timer-btn timer-start'; }
-      refreshMeasUI(pid, key);
-    } else {
-      ts.start = Date.now();
-      ts.running = true;
-      const btn = document.getElementById('tb-' + key);
-      if (btn) { btn.textContent = '⏹ Stop'; btn.className = 'timer-btn timer-stop'; }
-      const disp = document.getElementById('td-' + key);
-      if (disp) disp.textContent = '0.00s';
-      function tick() {
-        if (!timerState[key]?.running) return;
-        const el = Date.now() - timerState[key].start;
-        const d = document.getElementById('td-' + key);
-        if (d) d.textContent = (el/1000).toFixed(2) + 's';
-        timerRAF[key] = requestAnimationFrame(tick);
-      }
-      timerRAF[key] = requestAnimationFrame(tick);
-    }
-  };
-
-  window.timerReset = function(pid, key) {
-    cancelAnimationFrame(timerRAF[key]);
-    timerState[key] = { running: false, start: null };
-    const disp = document.getElementById('td-' + key);
-    if (disp) disp.textContent = '0.00s';
-    const btn = document.getElementById('tb-' + key);
-    if (btn) { btn.textContent = '▶ Start'; btn.className = 'timer-btn timer-start'; }
-  };
-
-  // ── Keypad ────────────────────────────────────────────────────────────────
-  window.openKeypad = function(pid, key, label) {
-    keypadState = { pid, key, buffer: '' };
-    document.getElementById('kp-title').textContent = label;
-    document.getElementById('kp-display').textContent = '0';
-    document.getElementById('kp-overlay').style.display = 'flex';
-  };
-
-  window.closeKeypad = function() {
-    document.getElementById('kp-overlay').style.display = 'none';
-    keypadState = { pid: null, key: null, buffer: '' };
-  };
-
-  window.kpPress = function(ch) {
-    if (ch === '.' && keypadState.buffer.includes('.')) return;
-    if (keypadState.buffer === '0' && ch !== '.') keypadState.buffer = ch;
-    else keypadState.buffer += ch;
-    if (keypadState.buffer === '') keypadState.buffer = '0';
-    document.getElementById('kp-display').textContent = keypadState.buffer || '0';
-  };
-
-  window.kpBackspace = function() {
-    keypadState.buffer = keypadState.buffer.slice(0,-1);
-    document.getElementById('kp-display').textContent = keypadState.buffer || '0';
-  };
-
-  window.kpConfirm = function() {
-    const val = parseFloat(keypadState.buffer);
-    if (isNaN(val) || val <= 0) { alert('Enter a valid number'); return; }
-    const { pid, key } = keypadState;
-    const readings = [...getMeasReadings(pid, key), val.toFixed(2)];
-    saveMeasReadings(pid, key, readings);
-    refreshMeasUI(pid, key);
-    closeKeypad();
   };
 
   window.saveNotesNow = function(pid) {
@@ -823,24 +446,18 @@
 
   window.nextPlayer = function() {
     const idx = players.findIndex(x => x.id === currentEvalPid);
-    if (idx < players.length-1) { currentEvalPid = players[idx+1].id; renderSidebar(); renderEvalForm(); }
+    if (idx < players.length-1) { currentEvalPid = players[idx+1].id; renderEvalForm(); }
   };
 
   // ── Aggregation ──────────────────────────────────────────────────────────
   function aggAvg(pid) {
-    // Only include skills that have been scored; re-normalize weights to sum to 1
-    let weightedSum = 0, weightUsed = 0;
-    SK.forEach(k => {
-      const vals = coaches.map(c => scores[pid] && scores[pid][c.id] ? scores[pid][c.id][k] : null).filter(v => v);
-      if (!vals.length) return; // skip unscored skills entirely
-      const avg = vals.reduce((a,b) => a+b,0) / vals.length;
-      const w = WEIGHTS[k] || (1/SK.length);
-      weightedSum += avg * w;
-      weightUsed += w;
+    const all = [];
+    coaches.forEach(c => {
+      if (!scores[pid] || !scores[pid][c.id]) return;
+      SK.forEach(k => { const v = scores[pid][c.id][k]; if (v) all.push(v); });
     });
-    if (!weightUsed) return '—';
-    // Divide by weightUsed (not 1.0) so partial scoring still produces a fair number
-    return (weightedSum / weightUsed).toFixed(1);
+    if (!all.length) return '—';
+    return (all.reduce((a,b) => a+b,0) / all.length).toFixed(1);
   }
 
   function skillAgg(pid, key) {
@@ -851,16 +468,8 @@
 
   function coachAvg(pid, cid) {
     if (!scores[pid] || !scores[pid][cid]) return null;
-    const cs = scores[pid][cid];
-    // Use weighted avg, skipping unscored skills (same logic as aggAvg)
-    let wsum = 0, wused = 0;
-    SK.forEach(k => {
-      const v = cs[k];
-      if (!v) return;
-      const w = WEIGHTS[k] || (1/SK.length);
-      wsum += v * w; wused += w;
-    });
-    return wused ? (wsum / wused).toFixed(1) : null;
+    const v = SK.map(k => scores[pid][cid][k] || 0).filter(v => v > 0);
+    return v.length ? (v.reduce((a,b) => a+b,0)/v.length).toFixed(1) : null;
   }
 
   // ── Results ──────────────────────────────────────────────────────────────
@@ -878,28 +487,19 @@
 
   function renderResults() {
     renderSummary();
-    populateAgeDropdown('res-age');
     const q    = (document.getElementById('res-srch').value || '').toLowerCase();
     const pos  = document.getElementById('res-pos').value;
-    const age  = document.getElementById('res-age').value;
     const sort = document.getElementById('res-sort').value;
-    let list = players.filter(p =>
-      `${p.first} ${p.last} ${p.num} ${p.pos}`.toLowerCase().includes(q) &&
-      (!pos || p.pos === pos || p.pos2 === pos) &&
-      (!age || p.age === age)
-    );
-    if (sort === 'avg')    list.sort((a,b) => (parseFloat(aggAvg(b.id))||0) - (parseFloat(aggAvg(a.id))||0));
-    else if (sort === 'name')   list.sort((a,b) => `${a.last}${a.first}`.localeCompare(`${b.last}${b.first}`));
-    else if (sort === 'tryout') list.sort((a,b) => (parseInt(a.num)||999) - (parseInt(b.num)||999));
-    else if (sort === 'age')    list.sort((a,b) => (a.age||'').localeCompare(b.age||''));
+    let list = players.filter(p => `${p.first} ${p.last} ${p.num} ${p.pos}`.toLowerCase().includes(q) && (!pos || p.pos === pos));
+    if (sort === 'avg')  list.sort((a,b) => (parseFloat(aggAvg(b.id))||0) - (parseFloat(aggAvg(a.id))||0));
+    if (sort === 'name') list.sort((a,b) => `${a.last}${a.first}`.localeCompare(`${b.last}${b.first}`));
+    if (sort === 'pos')  list.sort((a,b) => (a.pos||'').localeCompare(b.pos||''));
 
-    const _mh = { speed30: '30yd', speed60: '60yd', pitchVelo: 'Velo', popTime: 'Pop' };
     document.getElementById('res-head').innerHTML = `<tr>
-      <th>#</th><th>Name</th><th>Pos</th><th>Age Grp</th>
-      ${SKILLS.map((s,i) => `<th title="${s}">${s.split(' ').map(w=>w[0]).join('')}</th>`).join('')}
+      <th>#</th><th>Name</th><th>Pos</th><th>Age</th>
+      ${SKILLS.map(s => `<th>${s.split(' ')[0]}</th>`).join('')}
       <th>Overall</th>
-      ${MEAS_FIELDS.map(m => `<th title="${m.label}">${_mh[m.key]||m.key}</th>`).join('')}
-      ${coaches.map(c => `<th style="color:${c.color}">${c.name.split(' ')[0]}</th>`).join('')}
+      ${coaches.map(c => `<th style="color:${c.color}">${c.name.split(' ').pop()}</th>`).join('')}
       <th>Notes</th>
     </tr>`;
 
@@ -932,20 +532,6 @@
         return `<td style="font-size:12px;color:${v ? c.color : '#999'};font-weight:${v?'500':'400'}">${v||'—'}</td>`;
       }).join('');
 
-      const measCells = MEAS_FIELDS.map(m => {
-        // Collect all readings from all coaches (array or legacy single)
-        const allNums = [];
-        coaches.forEach(c => {
-          if (!scores[p.id] || !scores[p.id][c.id]) return;
-          const raw = scores[p.id][c.id][m.key];
-          if (!raw) return;
-          const arr = Array.isArray(raw) ? raw : [raw];
-          arr.forEach(r => { const n = parseFloat(r); if (!isNaN(n) && n > 0) allNums.push(n); });
-        });
-        const avg = allNums.length ? (allNums.reduce((a,b)=>a+b,0)/allNums.length).toFixed(2) : '—';
-        return `<td style="font-size:12px;color:var(--txt)">${avg}</td>`;
-      }).join('');
-
       const notes = coaches.map(c => {
         const n = scores[p.id] && scores[p.id][c.id] ? scores[p.id][c.id].notes : '';
         return n ? `${c.name.split(' ').pop()}: ${n}` : null;
@@ -954,10 +540,9 @@
       return `<tr>
         <td>${p.num||'—'}</td>
         <td class="bold-cell">${p.first} ${p.last}</td>
-        <td>${[p.pos,p.pos2].filter(Boolean).join('/')||'—'}</td><td>${p.age||'—'}</td>
+        <td>${p.pos||'—'}</td><td>${p.age||'—'}</td>
         ${skillCells}
         <td><span class="badge ${pc}">${avg}</span></td>
-        ${measCells}
         ${coachCells}
         <td class="notes-cell" title="${notes}">${notes}</td>
       </tr>`;
@@ -966,25 +551,19 @@
 
   // ── Export ───────────────────────────────────────────────────────────────
   window.exportCSV = function() {
-    const rows = [['Tryout #','First','Last','Age Group','Position',
+    const rows = [['Jersey #','First','Last','Age','Position','Group',
       ...SKILLS.map(s => s+' (avg)'),
-      'Overall (weighted)',
-      ...MEAS_FIELDS.map(m => m.label+' (avg)'),
-      ...coaches.flatMap(c => [c.name+' Overall', ...SKILLS.map(s => c.name+' '+s), ...MEAS_FIELDS.map(m => c.name+' '+m.label)]),
+      'Overall Avg',
+      ...coaches.flatMap(c => [c.name+' Avg', ...SKILLS.map(s => c.name+' '+s)]),
       ...coaches.map(c => c.name+' Notes')
     ]];
     players.forEach(p => {
-      rows.push([p.num, p.first, p.last, p.age, p.pos,
+      rows.push([p.num, p.first, p.last, p.age, p.pos, p.group,
         ...SK.map(k => skillAgg(p.id,k) || ''),
         aggAvg(p.id),
-        ...MEAS_FIELDS.map(m => {
-          const vals = coaches.map(c => scores[p.id]&&scores[p.id][c.id]?parseFloat(scores[p.id][c.id][m.key])||null:null).filter(v=>v);
-          return vals.length ? (vals.reduce((a,b)=>a+b,0)/vals.length).toFixed(2) : '';
-        }),
         ...coaches.flatMap(c => [
           coachAvg(p.id,c.id) || '',
-          ...SK.map(k => scores[p.id] && scores[p.id][c.id] ? scores[p.id][c.id][k]||'' : ''),
-          ...MEAS_FIELDS.map(m => scores[p.id]&&scores[p.id][c.id]?scores[p.id][c.id][m.key]||'':'')
+          ...SK.map(k => scores[p.id] && scores[p.id][c.id] ? scores[p.id][c.id][k]||'' : '')
         ]),
         ...coaches.map(c => '"' + ((scores[p.id]&&scores[p.id][c.id]?scores[p.id][c.id].notes:'')||'').replace(/"/g,'""') + '"')
       ]);
@@ -1011,30 +590,8 @@
   window.renderResults      = renderResults;
   window.renderSummary      = renderSummary;
 
-  // ── Password gate ────────────────────────────────────────────────────────
-  const CORRECT_PASSWORD = 'Baseball1!';
-
-  window.checkPassword = function() {
-    const val = document.getElementById('pw-input').value;
-    if (val === CORRECT_PASSWORD) {
-      document.getElementById('screen-password').style.display = 'none';
-      loadAll();
-    } else {
-      document.getElementById('pw-error').style.display = 'block';
-      document.getElementById('pw-input').value = '';
-      document.getElementById('pw-input').focus();
-    }
-  };
-
   // ── Boot ─────────────────────────────────────────────────────────────────
-  document.addEventListener('DOMContentLoaded', function() {
-    // Show password screen first, hide everything else
-    document.getElementById('screen-password').style.display = 'block';
-    document.getElementById('screen-loading').style.display = 'none';
-    document.getElementById('screen-login').style.display = 'none';
-    document.getElementById('screen-main').style.display = 'none';
-    setTimeout(() => document.getElementById('pw-input').focus(), 100);
-  });
+  document.addEventListener('DOMContentLoaded', loadAll);
 </script>
 
 <style>
@@ -1142,8 +699,8 @@
   .skill-item {}
   .slbl { font-size: 12px; color: var(--txt2); margin-bottom: 6px; display: flex; justify-content: space-between; align-items: center; }
   .sval { font-size: 13px; font-weight: 600; color: var(--txt); }
-  .strack { display: flex; gap: 5px; flex-wrap: wrap; }
-  .sc { width: 44px; height: 44px; border-radius: 7px; display: flex; align-items: center; justify-content: center; cursor: pointer; font-size: 15px; font-weight: 600; background: var(--bg2); border: 0.5px solid var(--bdr); color: var(--txt2); user-select: none; -webkit-tap-highlight-color: transparent; }
+  .strack { display: flex; gap: 3px; flex-wrap: wrap; }
+  .sc { width: 28px; height: 28px; border-radius: 5px; display: flex; align-items: center; justify-content: center; cursor: pointer; font-size: 12px; font-weight: 600; background: var(--bg2); border: 0.5px solid var(--bdr); color: var(--txt2); user-select: none; -webkit-tap-highlight-color: transparent; }
   .sc.on { background: var(--red); border-color: var(--red-d); color: #fff; }
   .sc:active { transform: scale(0.93); }
   .notes-wrap { margin-bottom: 4px; }
@@ -1193,31 +750,6 @@
   .new-coach-row input { flex: 1; padding: 8px 10px; font-size: 13px; border: 0.5px solid var(--bdr2); border-radius: var(--radius-sm); background: var(--bg); color: var(--txt); }
 
   .empty { text-align: center; padding: 2rem; color: var(--txt2); font-size: 14px; }
-  .meas-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 4px; }
-  .meas-item {}
-  .meas-input { width: 100%; padding: 8px 10px; font-size: 15px; font-weight: 600; border: 0.5px solid var(--bdr2); border-radius: var(--radius-sm); background: var(--bg); color: var(--txt); text-align: center; }
-  .meas-input:focus { outline: none; border-color: var(--red); }
-  .timer-display { font-size: 28px; font-weight: 700; color: var(--txt); text-align: center; letter-spacing: 1px; padding: 8px 0 6px; font-variant-numeric: tabular-nums; }
-  .timer-btns { display: flex; gap: 6px; }
-  .timer-btn { flex: 1; padding: 9px 0; font-size: 13px; font-weight: 600; border-radius: var(--radius-sm); border: none; cursor: pointer; transition: all .1s; }
-  .timer-btn:active { transform: scale(0.96); }
-  .timer-start { background: #1b5e20; color: #fff; }
-  .timer-start:hover { background: #2e7d32; }
-  .timer-stop  { background: var(--red); color: #fff; }
-  .timer-stop:hover  { background: var(--red-d); }
-  .timer-reset { background: var(--bg2); color: var(--txt2); border: 0.5px solid var(--bdr2) !important; flex: 0 0 72px; }
-  .timer-reset:hover { background: var(--bg3); }
-  @media (max-width: 600px) { .meas-grid { grid-template-columns: 1fr 1fr; } }
-  .mread-list { margin-top:6px;display:flex;flex-direction:column;gap:3px;min-height:20px }
-  .mread-row { display:flex;align-items:center;justify-content:space-between;padding:4px 8px;background:var(--bg2);border-radius:var(--radius-sm);border:0.5px solid var(--bdr) }
-  .mread-val { font-size:13px;font-weight:600;color:var(--txt) }
-  .mread-del { background:none;border:none;color:var(--txt3);cursor:pointer;font-size:13px;padding:0 2px;line-height:1 }
-  .mread-del:hover { color:var(--red) }
-  .mread-avg { font-size:11px;font-weight:600;color:var(--txt2);margin-top:4px;text-align:right }
-  .kp-btn { padding:14px;font-size:18px;font-weight:600;border:0.5px solid var(--bdr2);border-radius:var(--radius-sm);background:var(--bg2);color:var(--txt);cursor:pointer }
-  .kp-btn:hover { background:var(--bg3) }
-  .kp-btn:active { transform:scale(0.95) }
-  .kp-del { background:var(--bg3);color:var(--txt2) }
 
   /* Mobile tweaks */
   @media (max-width: 600px) {
@@ -1233,71 +765,10 @@
 </head>
 <body>
 <div id="save-ind">✓ Saved</div>
-
-<!-- Edit Player Modal -->
-<div id="edit-modal-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:1000;align-items:center;justify-content:center;padding:16px">
-  <div style="background:var(--bg);border-radius:var(--radius);padding:20px;width:100%;max-width:560px;max-height:90vh;overflow-y:auto">
-    <div id="edit-modal-body"></div>
-  </div>
-</div>
-
-<!-- Keypad Modal -->
-<div id="kp-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:1000;align-items:center;justify-content:center;padding:16px">
-  <div style="background:var(--bg);border-radius:var(--radius);padding:20px;width:100%;max-width:320px">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-      <div style="font-size:14px;font-weight:600;color:var(--txt)" id="kp-title">Enter value</div>
-      <button class="btn sm del" onclick="closeKeypad()" style="font-size:16px;padding:2px 8px">✕</button>
-    </div>
-    <div id="kp-display" style="font-size:32px;font-weight:700;color:var(--txt);text-align:center;padding:12px 0;border-bottom:0.5px solid var(--bdr);margin-bottom:12px;letter-spacing:1px;min-height:56px">0</div>
-    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:8px">
-      <button class="kp-btn" onclick="kpPress('7')">7</button>
-      <button class="kp-btn" onclick="kpPress('8')">8</button>
-      <button class="kp-btn" onclick="kpPress('9')">9</button>
-      <button class="kp-btn" onclick="kpPress('4')">4</button>
-      <button class="kp-btn" onclick="kpPress('5')">5</button>
-      <button class="kp-btn" onclick="kpPress('6')">6</button>
-      <button class="kp-btn" onclick="kpPress('1')">1</button>
-      <button class="kp-btn" onclick="kpPress('2')">2</button>
-      <button class="kp-btn" onclick="kpPress('3')">3</button>
-      <button class="kp-btn" onclick="kpPress('.')">.</button>
-      <button class="kp-btn" onclick="kpPress('0')">0</button>
-      <button class="kp-btn kp-del" onclick="kpBackspace()">⌫</button>
-    </div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
-      <button class="btn" onclick="closeKeypad()">Cancel</button>
-      <button class="btn pri" onclick="kpConfirm()">Add reading</button>
-    </div>
-  </div>
-</div>
-
 <div id="app">
 
-  <!-- Password Gate -->
-  <div id="screen-password">
-    <div class="login-wrap">
-      <div class="login-card" style="max-width:360px">
-        <div style="display:flex;align-items:center;gap:12px;margin-bottom:20px">
-          <div class="hdr-ico">⚾</div>
-          <div>
-            <div class="login-title">Tryout Evaluator</div>
-            <div class="login-sub" style="margin:0">Ninth Inning Baseball</div>
-          </div>
-        </div>
-        <hr style="border:none;border-top:0.5px solid var(--bdr);margin-bottom:20px">
-        <div class="fg" style="margin-bottom:14px">
-          <label style="font-size:12px;color:var(--txt2);display:block;margin-bottom:6px">Enter password to continue</label>
-          <input type="password" id="pw-input" placeholder="Password"
-            style="width:100%;padding:10px 12px;font-size:15px;border:0.5px solid var(--bdr2);border-radius:var(--radius-sm);background:var(--bg);color:var(--txt);"
-            onkeydown="if(event.key==='Enter')checkPassword()">
-        </div>
-        <div id="pw-error" style="display:none;color:#c8102e;font-size:12px;margin-bottom:10px">Incorrect password. Try again.</div>
-        <button class="btn pri" style="width:100%;padding:10px;font-size:15px" onclick="checkPassword()">Enter</button>
-      </div>
-    </div>
-  </div>
-
   <!-- Loading -->
-  <div id="screen-loading" style="display:none">
+  <div id="screen-loading">
     <div class="spinner"></div>
     <div id="loading-msg" style="font-size:14px;color:#888">Connecting to database...</div>
   </div>
@@ -1351,54 +822,27 @@
     <!-- Roster -->
     <div id="tab-roster" class="section active">
       <div class="toolbar">
-        <input type="text" id="r-srch" placeholder="Search by name..." oninput="renderRoster()" style="min-width:120px">
-        <select id="r-age" onchange="renderRoster()" style="padding:8px 10px;font-size:13px;border:0.5px solid var(--bdr2);border-radius:var(--radius-sm);background:var(--bg);color:var(--txt)">
-          <option value="">All ages</option>
-        </select>
-        <select id="r-sort" onchange="renderRoster()" style="padding:8px 10px;font-size:13px;border:0.5px solid var(--bdr2);border-radius:var(--radius-sm);background:var(--bg);color:var(--txt)">
-          <option value="name">Sort: Name</option>
-          <option value="tryout">Sort: Tryout #</option>
-          <option value="age">Sort: Age Group</option>
-        </select>
+        <input type="text" id="r-srch" placeholder="Search players..." oninput="renderRoster()">
         <button class="btn" onclick="document.getElementById('csv-inp').click()">⬆ Import CSV</button>
         <input type="file" id="csv-inp" accept=".csv" style="display:none" onchange="importCSV(event)">
         <button class="btn" onclick="toggleAddForm()">+ Add player</button>
       </div>
       <div id="add-form" style="display:none" class="add-form">
-        <div style="display:flex;gap:12px;align-items:flex-start;margin-bottom:10px">
-          <div style="flex-shrink:0">
-            <div id="add-photo-preview" style="width:72px;height:72px;border-radius:var(--radius);background:var(--bg2);border:0.5px solid var(--bdr2);display:flex;align-items:center;justify-content:center;font-size:28px;overflow:hidden;cursor:pointer" onclick="document.getElementById('add-photo-inp').click()">📷</div>
-            <input type="file" id="add-photo-inp" accept="image/*" capture="environment" style="display:none" onchange="previewAddPhoto(event)">
-            <div style="font-size:10px;color:var(--txt3);text-align:center;margin-top:3px">Tap for photo</div>
-          </div>
-          <div style="flex:1">
         <div class="frow c4">
           <div class="fg"><label>First name</label><input id="ff" type="text" placeholder="First"></div>
           <div class="fg"><label>Last name</label><input id="fl" type="text" placeholder="Last"></div>
-          <div class="fg"><label>Age group</label>
-            <select id="fa" style="width:100%;padding:6px 8px;font-size:13px;border:0.5px solid var(--bdr2);border-radius:var(--radius-sm);background:var(--bg);color:var(--txt)">
-              <option value="">Select...</option>
-              <option>7U</option><option>8U</option><option>9U</option><option>10U</option>
-              <option>11U</option><option>12U</option><option>13U</option><option>14U</option>
-              <option>15U</option><option>16U</option><option>17U</option><option>18U</option>
-            </select>
-          </div>
-          <div class="fg"><label>Tryout number</label><input id="fg2" type="text" placeholder="e.g. 42"></div>
+          <div class="fg"><label>Age</label><input id="fa" type="text" placeholder="14"></div>
+          <div class="fg"><label>Jersey #</label><input id="fn" type="text" placeholder="22"></div>
         </div>
-        <div class="frow c4">
-          <div class="fg"><label>Primary position</label>
+        <div class="frow c3">
+          <div class="fg"><label>Position</label>
             <select id="fp"><option value="">Select...</option>
               <option>Pitcher</option><option>Catcher</option><option>1B</option><option>2B</option><option>3B</option><option>SS</option><option>LF</option><option>CF</option><option>RF</option><option>Utility</option><option>Unknown</option>
             </select>
           </div>
-          <div class="fg"><label>Secondary position</label>
-            <select id="fp2"><option value="">Select...</option>
-              <option>Pitcher</option><option>Catcher</option><option>1B</option><option>2B</option><option>3B</option><option>SS</option><option>LF</option><option>CF</option><option>RF</option><option>Utility</option><option>Unknown</option>
-            </select>
-          </div>
+          <div class="fg"><label>Group / Division</label><input id="fg2" type="text" placeholder="Group A"></div>
+          <div class="fg"><label>Notes</label><input id="fno" type="text" placeholder="Optional"></div>
         </div>
-          </div><!-- end flex:1 -->
-        </div><!-- end photo+form row -->
         <div style="display:flex;gap:8px">
           <button class="btn pri" onclick="addPlayer()">Add player</button>
           <button class="btn" onclick="toggleAddForm()">Cancel</button>
@@ -1409,23 +853,9 @@
 
     <!-- Evaluate -->
     <div id="tab-eval" class="section">
-      <div id="eval-main-layout" style="display:flex;gap:12px;align-items:flex-start">
-      <div id="eval-sidebar" style="display:none;width:200px;flex-shrink:0;background:var(--bg);border:0.5px solid var(--bdr);border-radius:var(--radius);overflow:hidden">
-        <div style="padding:10px 12px;font-size:11px;font-weight:600;color:var(--txt2);border-bottom:0.5px solid var(--bdr);text-transform:uppercase;letter-spacing:.5px" id="sidebar-age-label">Players</div>
-        <div id="sidebar-list" style="overflow-y:auto;max-height:70vh"></div>
-      </div>
-      <div style="flex:1;min-width:0">
       <div id="eval-picker">
         <div class="toolbar">
-          <input type="text" id="ep-srch" placeholder="Search by name..." oninput="renderEvalPicker()" style="min-width:120px">
-          <select id="ep-age" onchange="renderEvalPicker()" style="padding:8px 10px;font-size:13px;border:0.5px solid var(--bdr2);border-radius:var(--radius-sm);background:var(--bg);color:var(--txt)">
-            <option value="">All ages</option>
-          </select>
-          <select id="ep-sort" onchange="renderEvalPicker()" style="padding:8px 10px;font-size:13px;border:0.5px solid var(--bdr2);border-radius:var(--radius-sm);background:var(--bg);color:var(--txt)">
-            <option value="name">Sort: Name</option>
-            <option value="tryout">Sort: Tryout #</option>
-            <option value="age">Sort: Age Group</option>
-          </select>
+          <input type="text" id="ep-srch" placeholder="Search player to evaluate..." oninput="renderEvalPicker()">
           <select id="ep-filter" onchange="renderEvalPicker()" style="padding:8px 10px;font-size:13px;border:0.5px solid var(--bdr2);border-radius:var(--radius-sm);background:var(--bg);color:var(--txt)">
             <option value="">All players</option>
             <option value="pending">Not scored by me</option>
@@ -1435,18 +865,13 @@
         <div id="eval-list" class="pgrid"></div>
       </div>
       <div id="eval-form-wrap" style="display:none"></div>
-      </div><!-- end flex:1 -->
-      </div><!-- end eval-main-layout -->
     </div>
 
     <!-- Results -->
     <div id="tab-results" class="section">
       <div class="stats-row" id="sum-stats"></div>
       <div class="toolbar">
-        <input type="text" id="res-srch" placeholder="Filter by name..." oninput="renderResults()" style="min-width:120px">
-        <select id="res-age" onchange="renderResults()" style="padding:8px 10px;font-size:13px;border:0.5px solid var(--bdr2);border-radius:var(--radius-sm);background:var(--bg);color:var(--txt)">
-          <option value="">All ages</option>
-        </select>
+        <input type="text" id="res-srch" placeholder="Filter by name..." oninput="renderResults()">
         <select id="res-pos" onchange="renderResults()" style="padding:8px 10px;font-size:13px;border:0.5px solid var(--bdr2);border-radius:var(--radius-sm);background:var(--bg);color:var(--txt)">
           <option value="">All positions</option>
           <option>Pitcher</option><option>Catcher</option><option>1B</option><option>2B</option><option>3B</option><option>SS</option><option>LF</option><option>CF</option><option>RF</option><option>Utility</option>
@@ -1454,8 +879,7 @@
         <select id="res-sort" onchange="renderResults()" style="padding:8px 10px;font-size:13px;border:0.5px solid var(--bdr2);border-radius:var(--radius-sm);background:var(--bg);color:var(--txt)">
           <option value="avg">Sort: Avg score</option>
           <option value="name">Sort: Name</option>
-          <option value="tryout">Sort: Tryout #</option>
-          <option value="age">Sort: Age Group</option>
+          <option value="pos">Sort: Position</option>
         </select>
         <button class="btn pri" onclick="exportCSV()">⬇ Export CSV</button>
       </div>
