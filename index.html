@@ -53,6 +53,17 @@
   let keypadState = { pid: null, key: null, buffer: '' };
   const PALETTE = ['#c8102e','#1565c0','#2e7d32','#6a1b9a','#e65100','#00695c','#bf360c'];
 
+  const AGE_GROUPS = ['7U','8U','9U','10U','11U','12U','13U','14U','15U','16U','17U','18U'];
+
+  function normalizeAge(raw) {
+    if (!raw) return '';
+    const n = raw.toString().replace(/[^0-9]/g,'');
+    if (!n) return raw;
+    const num = parseInt(n);
+    if (num >= 7 && num <= 18) return num + 'U';
+    return raw;
+  }
+
   let coaches  = [];
   let players  = [];
   let scores   = {};   // scores[pid][cid][skillKey|'notes']
@@ -212,9 +223,8 @@
     const id = newId('c');
     const color = PALETTE[coaches.length % PALETTE.length];
     await setDoc(doc(db, 'coaches', id), { name, color });
-    coaches.push({ id, name, color });
+    // Don't push locally — onSnapshot listener handles it
     inp.value = '';
-    renderLogin();
   };
 
   window.loginAs = function(id) {
@@ -238,6 +248,31 @@
     f.style.display = f.style.display === 'none' ? 'block' : 'none';
   };
 
+  let addPhotoBase64 = null;
+  let editPhotoBase64 = null;
+
+  window.previewEditPhoto = function(e) {
+    const file = e.target.files[0]; if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      editPhotoBase64 = ev.target.result;
+      const prev = document.getElementById('edit-photo-preview');
+      if (prev) prev.innerHTML = `<img src="${ev.target.result}" style="width:100%;height:100%;object-fit:cover">`;
+    };
+    reader.readAsDataURL(file);
+  };
+
+  window.previewAddPhoto = function(e) {
+    const file = e.target.files[0]; if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      addPhotoBase64 = ev.target.result;
+      const prev = document.getElementById('add-photo-preview');
+      if (prev) prev.innerHTML = `<img src="${ev.target.result}" style="width:100%;height:100%;object-fit:cover">`;
+    };
+    reader.readAsDataURL(file);
+  };
+
   window.addPlayer = async function() {
     const first = document.getElementById('ff').value.trim();
     const last  = document.getElementById('fl').value.trim();
@@ -245,10 +280,11 @@
     const id = newId('p');
     const data = {
       first, last,
-      age:   document.getElementById('fa').value.trim(),
+      age:   normalizeAge(document.getElementById('fa').value.trim()),
       num:   document.getElementById('fg2').value.trim(),
       pos:   document.getElementById('fp').value,
       pos2:  document.getElementById('fp2').value,
+      photo: addPhotoBase64 || '',
       group: '',
       notes: '',
       createdAt: Date.now()
@@ -258,6 +294,9 @@
     ['ff','fl','fa','fn','fg2'].forEach(x => { const el=document.getElementById(x); if(el) el.value=''; });
     document.getElementById('fp').value = '';
     document.getElementById('fp2').value = '';
+    addPhotoBase64 = null;
+    const prev = document.getElementById('add-photo-preview');
+    if (prev) prev.innerHTML = '📷';
     toggleAddForm();
   };
 
@@ -276,6 +315,7 @@
   window.openEditPlayer = function(pid) {
     const p = players.find(x => x.id === pid);
     if (!p) return;
+    editPhotoBase64 = null;
     const posOpts = ['','Pitcher','Catcher','1B','2B','3B','SS','LF','CF','RF','Utility','Unknown'];
     const selOpt = (val) => posOpts.map(o => `<option value="${o}" ${o===val?'selected':''}>${o||'Select...'}</option>`).join('');
     document.getElementById('edit-modal-body').innerHTML = `
@@ -283,10 +323,22 @@
         <div style="font-size:16px;font-weight:600;color:var(--txt)">Edit Player</div>
         <button class="btn sm del" onclick="closeEditModal()" style="font-size:16px;padding:2px 8px">✕</button>
       </div>
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
+        <div id="edit-photo-preview" style="width:72px;height:72px;border-radius:var(--radius);overflow:hidden;border:0.5px solid var(--bdr2);cursor:pointer;display:flex;align-items:center;justify-content:center;background:var(--bg2);font-size:28px" onclick="document.getElementById('edit-photo-inp').click()">
+          ${p.photo ? `<img src="${p.photo}" style="width:100%;height:100%;object-fit:cover">` : '📷'}
+        </div>
+        <div style="font-size:12px;color:var(--txt2)">Tap photo to change</div>
+        <input type="file" id="edit-photo-inp" accept="image/*" capture="environment" style="display:none" onchange="previewEditPhoto(event)">
+      </div>
       <div class="frow c4" style="margin-bottom:8px">
         <div class="fg"><label>First name</label><input id="ef-first" type="text" value="${p.first}"></div>
         <div class="fg"><label>Last name</label><input id="ef-last" type="text" value="${p.last}"></div>
-        <div class="fg"><label>Age group</label><input id="ef-age" type="text" value="${p.age||''}"></div>
+        <div class="fg"><label>Age group</label>
+          <select id="ef-age" style="width:100%;padding:6px 8px;font-size:13px;border:0.5px solid var(--bdr2);border-radius:var(--radius-sm);background:var(--bg);color:var(--txt)">
+            <option value="">Select...</option>
+            ${ ['7U','8U','9U','10U','11U','12U','13U','14U','15U','16U','17U','18U'].map(a=>'<option value="'+a+'"'+(normalizeAge(p.age||'')===a?' selected':'')+'>'+a+'</option>').join('') }
+          </select>
+        </div>
         <div class="fg"><label>Tryout #</label><input id="ef-num" type="text" value="${p.num||''}"></div>
       </div>
       <div class="frow c4" style="margin-bottom:16px">
@@ -312,10 +364,11 @@
     if (!first || !last) { alert('Name required'); return; }
     const updates = {
       first, last,
-      age:  document.getElementById('ef-age').value.trim(),
+      age:  normalizeAge(document.getElementById('ef-age').value.trim()),
       num:  document.getElementById('ef-num').value.trim(),
       pos:  document.getElementById('ef-pos').value,
       pos2: document.getElementById('ef-pos2').value,
+      photo: editPhotoBase64 !== null ? editPhotoBase64 : (p.photo || ''),
     };
     Object.assign(p, updates);
     await setDoc(doc(db, 'players', pid), { ...p });
@@ -343,7 +396,7 @@
         const id = newId('p');
         const data = {
           first, last,
-          age:   get(row, ['age','gradyear','grad']),
+          age:   normalizeAge(get(row, ['age','gradyear','grad'])),
           num:   get(row, ['number','num','jersey','jerseynumber']),
           pos:   get(row, ['position','pos']),
           group: get(row, ['group','team','division']),
@@ -391,8 +444,12 @@
       const myScored = activeCoach && scores[p.id] && scores[p.id][activeCoach.id] && SK.some(k => scores[p.id][activeCoach.id][k]);
       const coachCount = coaches.filter(c => scores[p.id] && scores[p.id][c.id] && SK.some(k => scores[p.id][c.id][k])).length;
       const posDisplay = [p.pos, p.pos2].filter(Boolean).join(' / ');
-      return `<div class="prow" style="cursor:pointer" onclick="openEditPlayer('${p.id}')">
+      const photoHtml = p.photo
+        ? `<img src="${p.photo}" style="width:36px;height:36px;border-radius:50%;object-fit:cover;border:0.5px solid var(--bdr);flex-shrink:0">`
+        : `<div style="width:36px;height:36px;border-radius:50%;background:var(--bg2);border:0.5px solid var(--bdr);display:flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0">${p.first[0]}${p.last[0]}</div>`;
+      return `<div class="prow" style="cursor:pointer;grid-template-columns:36px 36px 1fr auto auto auto" onclick="openEditPlayer('${p.id}')">
         <div class="pnum">${p.num || '—'}</div>
+        ${photoHtml}
         <div>
           <div class="pname">${p.first} ${p.last}</div>
           <div class="pmeta">${posDisplay || '—'} · ${p.age || '—'}</div>
@@ -434,12 +491,36 @@
     currentEvalPid = pid;
     document.getElementById('eval-picker').style.display = 'none';
     document.getElementById('eval-form-wrap').style.display = 'block';
+    document.getElementById('eval-sidebar').style.display = 'block';
+    renderSidebar();
     renderEvalForm();
   };
+
+  function renderSidebar() {
+    const ageFilter = document.getElementById('ep-age')?.value || '';
+    const sidebar = document.getElementById('sidebar-list');
+    const label = document.getElementById('sidebar-age-label');
+    if (label) label.textContent = ageFilter ? ageFilter + ' Players' : 'All Players';
+    let list = ageFilter ? players.filter(p => p.age === ageFilter) : players;
+    list = [...list].sort((a,b) => (parseInt(a.num)||999)-(parseInt(b.num)||999));
+    if (!sidebar) return;
+    sidebar.innerHTML = list.map(p => {
+      const isCurrent = p.id === currentEvalPid;
+      const myScored = activeCoach && scores[p.id] && scores[p.id][activeCoach.id] && SK.some(k => scores[p.id][activeCoach.id][k]);
+      return `<div onclick="openEval('${p.id}')" style="padding:8px 12px;cursor:pointer;border-bottom:0.5px solid var(--bdr);background:${isCurrent?'var(--red)':'var(--bg)'};transition:background .1s">
+        <div style="font-size:13px;font-weight:600;color:${isCurrent?'#fff':'var(--txt)'}">#${p.num||'—'} ${p.first} ${p.last}</div>
+        <div style="font-size:11px;color:${isCurrent?'rgba(255,255,255,0.8)':'var(--txt2)'};">${p.pos||'—'} ${myScored?'✓':''}</div>
+      </div>`;
+    }).join('');
+    // Scroll active player into view
+    const active = sidebar.querySelector(`div[style*="var(--red)"]`);
+    if (active) active.scrollIntoView({block:'nearest'});
+  }
 
   window.closeEval = function() {
     document.getElementById('eval-picker').style.display = 'block';
     document.getElementById('eval-form-wrap').style.display = 'none';
+    document.getElementById('eval-sidebar').style.display = 'none';
     renderEvalPicker();
   };
 
@@ -466,12 +547,11 @@
 
     const scoreRow = (key, label) => {
       const val = cs[key] || 0;
-      const w = Math.round((WEIGHTS[key]||0)*100);
       const btns = Array.from({length:10}, (_,i) =>
         `<button class="sc${val > i ? ' on' : ''}" onclick="setScore('${p.id}','${key}',${i+1})">${i+1}</button>`
       ).join('');
       return `<div class="skill-item">
-        <div class="slbl">${label} <span style="font-size:10px;color:var(--txt3)">${w}%</span> <span class="sval" id="sv-${key}">${val ? val+'/10' : '—'}</span></div>
+        <div class="slbl">${label} <span class="sval" id="sv-${key}">${val ? val+'/10' : '—'}</span></div>
         <div class="strack">${btns}</div>
       </div>`;
     };
@@ -525,7 +605,10 @@
       <div class="eval-card">
         <div class="eval-hdr">
           <div>
-            <div class="eval-pname">${p.first} ${p.last}</div>
+            <div style="display:flex;align-items:center;gap:10px">
+          ${p.photo ? `<img src="${p.photo}" style="width:48px;height:48px;border-radius:50%;object-fit:cover;border:0.5px solid var(--bdr)">` : `<div style="width:48px;height:48px;border-radius:50%;background:var(--bg2);border:0.5px solid var(--bdr);display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:600;color:var(--txt2)">${p.first[0]}${p.last[0]}</div>`}
+          <div class="eval-pname">${p.first} ${p.last}</div>
+        </div>
             <div class="eval-meta">Tryout #${p.num||'—'} · ${p.pos||'—'} · ${p.age||'—'}</div>
             <div class="eval-coach-lbl" style="color:${activeCoach.color}">Scoring as ${activeCoach.name}</div>
           </div>
@@ -590,6 +673,7 @@
     if (avgEl) avgEl.textContent = myWeightedAvg(cs);
 
     scheduleSave(pid, activeCoach.id);
+    if (document.getElementById('eval-sidebar').style.display !== 'none') renderSidebar();
   };
 
   window.setMeas = function(pid, key, val) {
@@ -739,7 +823,7 @@
 
   window.nextPlayer = function() {
     const idx = players.findIndex(x => x.id === currentEvalPid);
-    if (idx < players.length-1) { currentEvalPid = players[idx+1].id; renderEvalForm(); }
+    if (idx < players.length-1) { currentEvalPid = players[idx+1].id; renderSidebar(); renderEvalForm(); }
   };
 
   // ── Aggregation ──────────────────────────────────────────────────────────
@@ -1058,8 +1142,8 @@
   .skill-item {}
   .slbl { font-size: 12px; color: var(--txt2); margin-bottom: 6px; display: flex; justify-content: space-between; align-items: center; }
   .sval { font-size: 13px; font-weight: 600; color: var(--txt); }
-  .strack { display: flex; gap: 3px; flex-wrap: wrap; }
-  .sc { width: 28px; height: 28px; border-radius: 5px; display: flex; align-items: center; justify-content: center; cursor: pointer; font-size: 12px; font-weight: 600; background: var(--bg2); border: 0.5px solid var(--bdr); color: var(--txt2); user-select: none; -webkit-tap-highlight-color: transparent; }
+  .strack { display: flex; gap: 5px; flex-wrap: wrap; }
+  .sc { width: 44px; height: 44px; border-radius: 7px; display: flex; align-items: center; justify-content: center; cursor: pointer; font-size: 15px; font-weight: 600; background: var(--bg2); border: 0.5px solid var(--bdr); color: var(--txt2); user-select: none; -webkit-tap-highlight-color: transparent; }
   .sc.on { background: var(--red); border-color: var(--red-d); color: #fff; }
   .sc:active { transform: scale(0.93); }
   .notes-wrap { margin-bottom: 4px; }
@@ -1281,10 +1365,24 @@
         <button class="btn" onclick="toggleAddForm()">+ Add player</button>
       </div>
       <div id="add-form" style="display:none" class="add-form">
+        <div style="display:flex;gap:12px;align-items:flex-start;margin-bottom:10px">
+          <div style="flex-shrink:0">
+            <div id="add-photo-preview" style="width:72px;height:72px;border-radius:var(--radius);background:var(--bg2);border:0.5px solid var(--bdr2);display:flex;align-items:center;justify-content:center;font-size:28px;overflow:hidden;cursor:pointer" onclick="document.getElementById('add-photo-inp').click()">📷</div>
+            <input type="file" id="add-photo-inp" accept="image/*" capture="environment" style="display:none" onchange="previewAddPhoto(event)">
+            <div style="font-size:10px;color:var(--txt3);text-align:center;margin-top:3px">Tap for photo</div>
+          </div>
+          <div style="flex:1">
         <div class="frow c4">
           <div class="fg"><label>First name</label><input id="ff" type="text" placeholder="First"></div>
           <div class="fg"><label>Last name</label><input id="fl" type="text" placeholder="Last"></div>
-          <div class="fg"><label>Age group</label><input id="fa" type="text" placeholder="e.g. 12U"></div>
+          <div class="fg"><label>Age group</label>
+            <select id="fa" style="width:100%;padding:6px 8px;font-size:13px;border:0.5px solid var(--bdr2);border-radius:var(--radius-sm);background:var(--bg);color:var(--txt)">
+              <option value="">Select...</option>
+              <option>7U</option><option>8U</option><option>9U</option><option>10U</option>
+              <option>11U</option><option>12U</option><option>13U</option><option>14U</option>
+              <option>15U</option><option>16U</option><option>17U</option><option>18U</option>
+            </select>
+          </div>
           <div class="fg"><label>Tryout number</label><input id="fg2" type="text" placeholder="e.g. 42"></div>
         </div>
         <div class="frow c4">
@@ -1299,6 +1397,8 @@
             </select>
           </div>
         </div>
+          </div><!-- end flex:1 -->
+        </div><!-- end photo+form row -->
         <div style="display:flex;gap:8px">
           <button class="btn pri" onclick="addPlayer()">Add player</button>
           <button class="btn" onclick="toggleAddForm()">Cancel</button>
@@ -1309,6 +1409,12 @@
 
     <!-- Evaluate -->
     <div id="tab-eval" class="section">
+      <div id="eval-main-layout" style="display:flex;gap:12px;align-items:flex-start">
+      <div id="eval-sidebar" style="display:none;width:200px;flex-shrink:0;background:var(--bg);border:0.5px solid var(--bdr);border-radius:var(--radius);overflow:hidden">
+        <div style="padding:10px 12px;font-size:11px;font-weight:600;color:var(--txt2);border-bottom:0.5px solid var(--bdr);text-transform:uppercase;letter-spacing:.5px" id="sidebar-age-label">Players</div>
+        <div id="sidebar-list" style="overflow-y:auto;max-height:70vh"></div>
+      </div>
+      <div style="flex:1;min-width:0">
       <div id="eval-picker">
         <div class="toolbar">
           <input type="text" id="ep-srch" placeholder="Search by name..." oninput="renderEvalPicker()" style="min-width:120px">
@@ -1329,6 +1435,8 @@
         <div id="eval-list" class="pgrid"></div>
       </div>
       <div id="eval-form-wrap" style="display:none"></div>
+      </div><!-- end flex:1 -->
+      </div><!-- end eval-main-layout -->
     </div>
 
     <!-- Results -->
