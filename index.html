@@ -1,0 +1,2097 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Tryout App</title>
+
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getFirestore, doc, setDoc, getDoc, onSnapshot, collection, getDocs, deleteDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyB5qoFoZy_fbXQngWWYg79mv3twMNJZysE",
+    authDomain: "tryout-app-5cdc1.firebaseapp.com",
+    projectId: "tryout-app-5cdc1",
+    storageBucket: "tryout-app-5cdc1.firebasestorage.app",
+    messagingSenderId: "851377690492",
+    appId: "1:851377690492:web:da90235338b336e7c536f9"
+  };
+
+  const app = initializeApp(firebaseConfig);
+  const db = getFirestore(app);
+
+  // ── State ────────────────────────────────────────────────────────────────
+  // Scored skills (1-10)
+  const SKILLS     = ['Hitting Contact','Hitting Power','Infield','Outfield','Pitching','Arm Strength','Catching'];
+  const SK         = ['hitContact','hitPower','infield','outfield','pitching','arm','catching'];
+  const SKILL_ABBR = ['H Con','H Pow','Inf','Outf','Pitch','Arm Str','Catching'];
+
+  // Weights for overall score (used proportionally — unscored skills are excluded)
+  const WEIGHTS = {
+    hitContact: 0.15,
+    hitPower:   0.15,
+    infield:    0.15,
+    outfield:   0.15,
+    pitching:   0.20,
+    arm:        0.10,
+    catching:   0.10,
+  };
+
+  // Raw measurement fields — values stored as arrays (multiple readings allowed)
+  // scores[pid][cid][key] = [] array of number strings
+  const MEAS_FIELDS = [
+    { key: 'speed30',   label: 'Home to 1st (30 yd)',  unit: 'sec',  timer: true  },
+    { key: 'speed60',   label: 'Home to 2nd (60 yd)',  unit: 'sec',  timer: true  },
+    { key: 'pitchVelo', label: 'Fastball Velocity',    unit: 'mph',  timer: false },
+    { key: 'popTime',   label: 'Catching Pop Time',    unit: 'sec',  timer: true  },
+  ];
+
+  // Timer state per measurement key
+  const timerState = {};
+
+  // Keypad state for manual entry
+  let keypadState = { pid: null, key: null, buffer: '' };
+
+  // Bulk selection state
+  let selectedIds = new Set();
+
+  // Favorites state: Map<playerId, Set<coachId>>
+  let favorites = new Map();
+
+  async function loadFavorites() {
+    try {
+      const snap = await getDocs(collection(db, 'favorites'));
+      favorites = new Map();
+      snap.forEach(d => {
+        const ids = d.data().coachIds || [];
+        favorites.set(d.id, new Set(ids));
+      });
+    } catch(e) { console.error('favorites load', e); }
+    // Live listener
+    onSnapshot(collection(db, 'favorites'), snap => {
+      snap.docChanges().forEach(change => {
+        if (change.type === 'removed') {
+          favorites.delete(change.doc.id);
+        } else {
+          favorites.set(change.doc.id, new Set(change.doc.data().coachIds || []));
+        }
+      });
+      renderRoster();
+      if (document.getElementById('tab-results').classList.contains('active')) renderResults();
+    });
+  }
+
+  window.toggleFavorite = async function(pid, e) {
+    if (e) e.stopPropagation();
+    if (!activeCoach) return;
+    if (!favorites.has(pid)) favorites.set(pid, new Set());
+    const set = favorites.get(pid);
+    if (set.has(activeCoach.id)) set.delete(activeCoach.id);
+    else set.add(activeCoach.id);
+    const coachIds = [...set];
+    if (coachIds.length === 0) {
+      await deleteDoc(doc(db, 'favorites', pid));
+    } else {
+      await setDoc(doc(db, 'favorites', pid), { coachIds });
+    }
+    // Re-render star in eval form if it's open for this player
+    if (currentEvalPid === pid) {
+      const btn = document.querySelector('.eval-star-btn');
+      if (btn) {
+        const fav = isFavorited(pid);
+        btn.style.color = fav ? '#f5a623' : 'var(--txt3)';
+        btn.textContent = fav ? '★' : '☆';
+      }
+    }
+    // Re-render star in roster rows
+    renderRoster();
+  };
+
+  function isFavorited(pid) {
+    return activeCoach && favorites.has(pid) && favorites.get(pid).has(activeCoach.id);
+  }
+
+  function starIcon(pid, extraStyle='') {
+    const fav = isFavorited(pid);
+    return `<button onclick="toggleFavorite('${pid}',event)" style="background:none;border:none;cursor:pointer;font-size:18px;padding:2px 6px;line-height:1;color:${fav?'#f5a623':'var(--txt3)'};-webkit-tap-highlight-color:transparent;flex-shrink:0;${extraStyle}">${fav?'★':'☆'}</button>`;
+  }
+
+  function favCount(pid) {
+    return favorites.has(pid) ? favorites.get(pid).size : 0;
+  }
+
+  function updateBulkBar() {
+    const bar = document.getElementById('bulk-bar');
+    const count = document.getElementById('bulk-count');
+    const allCb = document.getElementById('select-all-cb');
+    if (!bar) return;
+    if (selectedIds.size > 0) {
+      bar.style.display = 'flex';
+      count.textContent = `${selectedIds.size} player${selectedIds.size !== 1 ? 's' : ''} selected`;
+    } else {
+      bar.style.display = 'none';
+    }
+    // Update select-all checkbox state
+    if (allCb) {
+      const visible = getVisiblePlayers();
+      allCb.checked = visible.length > 0 && visible.every(p => selectedIds.has(p.id));
+      allCb.indeterminate = selectedIds.size > 0 && !allCb.checked;
+    }
+  }
+
+  function getVisiblePlayers() {
+    return applyListFiltersAndSort(players, 'r-srch', 'r-age', 'r-sort');
+  }
+
+  window.toggleSelect = function(pid) {
+    if (selectedIds.has(pid)) selectedIds.delete(pid);
+    else selectedIds.add(pid);
+    updateBulkBar();
+    renderRoster();
+  };
+
+  window.toggleSelectAll = function(checked) {
+    const visible = getVisiblePlayers();
+    if (checked) visible.forEach(p => selectedIds.add(p.id));
+    else visible.forEach(p => selectedIds.delete(p.id));
+    updateBulkBar();
+    renderRoster();
+  };
+
+  window.clearSelection = function() {
+    selectedIds.clear();
+    const allCb = document.getElementById('select-all-cb');
+    if (allCb) { allCb.checked = false; allCb.indeterminate = false; }
+    updateBulkBar();
+    renderRoster();
+  };
+
+  window.bulkSetAge = async function() {
+    const age = document.getElementById('bulk-age-select').value;
+    if (!age) { alert('Select an age group first'); return; }
+    if (!selectedIds.size) return;
+    if (!confirm(`Set age group to ${age} for ${selectedIds.size} player${selectedIds.size !== 1 ? 's' : ''}?`)) return;
+    const ids = [...selectedIds];
+    for (const pid of ids) {
+      const p = players.find(x => x.id === pid);
+      if (!p) continue;
+      p.age = age;
+      await setDoc(doc(db, 'players', pid), { ...p });
+    }
+    flashSave();
+    clearSelection();
+  };
+
+  window.removeDuplicates = function() {
+    // Group players by normalized name + normalized DOB
+    // Sort by createdAt ascending so we keep oldest (most likely has scores)
+    const sorted = [...players].sort((a,b) => (a.createdAt||0) - (b.createdAt||0));
+    const seen = new Map();
+    const toDelete = [];
+    const groupInfo = []; // track which duplicates belong to which original
+
+    for (const p of sorted) {
+      const namePart = (p.first + '|' + p.last).toLowerCase().trim();
+      const dobPart  = p.dob ? normalizeDOB(p.dob) : '__nodob__' + p.id;
+      const key = namePart + '|' + dobPart;
+      if (seen.has(key)) {
+        toDelete.push(p.id);
+        const existing = seen.get(key);
+        existing.dupes.push(p);
+      } else {
+        const entry = { keep: p, dupes: [] };
+        seen.set(key, entry);
+        groupInfo.push(entry);
+      }
+    }
+
+    const dupeGroups = groupInfo.filter(g => g.dupes.length > 0);
+
+    if (!dupeGroups.length) {
+      // Show in modal for consistency
+      document.getElementById('edit-modal-body').innerHTML = `
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+          <div style="font-size:16px;font-weight:600;color:var(--txt)">No duplicates found</div>
+          <button class="btn sm del" onclick="closeEditModal()" style="font-size:16px;padding:2px 8px">✕</button>
+        </div>
+        <p style="font-size:14px;color:var(--txt2);margin-bottom:16px">Every player in the roster appears to be unique.</p>
+        <div style="display:flex;justify-content:flex-end">
+          <button class="btn pri" onclick="closeEditModal()">Done</button>
+        </div>`;
+      document.getElementById('edit-modal-overlay').style.display = 'flex';
+      return;
+    }
+
+    const dupeListHTML = dupeGroups.map(g => {
+      const keepDOB = g.keep.dob ? ' · ' + formatDOB(g.keep.dob) : '';
+      const keepScored = coaches.some(c => scores[g.keep.id] && scores[g.keep.id][c.id] && SK.some(k => scores[g.keep.id][c.id][k]));
+      const dupesHTML = g.dupes.map(d => {
+        const dDOB = d.dob ? ' · ' + formatDOB(d.dob) : '';
+        const dScored = coaches.some(c => scores[d.id] && scores[d.id][c.id] && SK.some(k => scores[d.id][c.id][k]));
+        return `<div style="display:flex;align-items:center;gap:8px;padding:5px 10px;background:var(--red-bg);border-radius:4px;margin-top:4px">
+          <span style="font-size:12px;color:var(--red-txt)">✕ Delete: #${d.num||'—'} ${d.first} ${d.last}${dDOB}${dScored?' · <b>has scores</b>':''}</span>
+        </div>`;
+      }).join('');
+      return `<div style="margin-bottom:12px;padding:10px 12px;background:var(--bg2);border-radius:var(--radius-sm);border:0.5px solid var(--bdr)">
+        <div style="font-size:13px;font-weight:600;color:var(--txt);margin-bottom:4px">
+          ${g.keep.first} ${g.keep.last}${keepDOB} — ${g.dupes.length + 1} copies
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;padding:5px 10px;background:var(--green-bg);border-radius:4px;margin-bottom:2px">
+          <span style="font-size:12px;color:var(--green-txt)">✓ Keep: #${g.keep.num||'—'} ${g.keep.first} ${g.keep.last}${keepDOB}${keepScored?' · has scores':''}</span>
+        </div>
+        ${dupesHTML}
+      </div>`;
+    }).join('');
+
+    const warnMsg = toDelete.some(pid => {
+      return coaches.some(c => scores[pid] && scores[pid][c.id] && SK.some(k => scores[pid][c.id][k]));
+    }) ? `<div style="padding:10px 12px;background:var(--amber-bg);border:0.5px solid var(--amber-txt);border-radius:var(--radius-sm);margin-bottom:12px;font-size:13px;color:var(--amber-txt);font-weight:500">⚠ Some duplicates have scores — those scores will be permanently lost.</div>` : '';
+
+    document.getElementById('edit-modal-body').innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+        <div style="font-size:16px;font-weight:600;color:var(--txt)">Delete Duplicates</div>
+        <button class="btn sm del" onclick="closeEditModal()" style="font-size:16px;padding:2px 8px">✕</button>
+      </div>
+      <p style="font-size:13px;color:var(--txt2);margin-bottom:12px">Found <b>${toDelete.length} duplicate${toDelete.length!==1?'s':''}</b> across ${dupeGroups.length} player${dupeGroups.length!==1?'s':''}. The oldest record is kept, extras are deleted.</p>
+      ${warnMsg}
+      <div style="max-height:40vh;overflow-y:auto;margin-bottom:16px">${dupeListHTML}</div>
+      <div style="display:flex;gap:8px;justify-content:flex-end">
+        <button class="btn" onclick="closeEditModal()">Cancel</button>
+        <button class="btn" onclick="confirmDeleteDuplicates(${JSON.stringify(toDelete)})" style="background:#c8102e;color:#fff;border-color:#c8102e">Delete ${toDelete.length} duplicate${toDelete.length!==1?'s':''}</button>
+      </div>`;
+    document.getElementById('edit-modal-overlay').style.display = 'flex';
+  };
+
+  window.confirmDeleteDuplicates = async function(toDelete) {
+    closeEditModal();
+    for (const pid of toDelete) {
+      await deleteDoc(doc(db, 'players', pid));
+      for (const c of coaches) {
+        try { await deleteDoc(doc(db, 'scores', `${pid}__${c.id}`)); } catch(e){}
+      }
+      players = players.filter(p => p.id !== pid);
+      delete scores[pid];
+    }
+    flashSave();
+    renderRoster();
+  };
+
+  window.bulkDelete = async function() {
+    if (!selectedIds.size) return;
+    if (!confirm(`Permanently delete ${selectedIds.size} player${selectedIds.size !== 1 ? 's' : ''} and all their scores? This cannot be undone.`)) return;
+    const ids = [...selectedIds];
+    for (const pid of ids) {
+      await deleteDoc(doc(db, 'players', pid));
+      for (const c of coaches) {
+        try { await deleteDoc(doc(db, 'scores', `${pid}__${c.id}`)); } catch(e){}
+      }
+      players = players.filter(p => p.id !== pid);
+      delete scores[pid];
+    }
+    clearSelection();
+    flashSave();
+  };
+  const PALETTE = ['#c8102e','#1565c0','#2e7d32','#6a1b9a','#e65100','#00695c','#bf360c'];
+
+  // Results table sort state
+  let resSortCol = 'num';   // column key — default by tryout #
+  let resSortDir = 'asc';   // 'asc' | 'desc'
+
+  const AGE_GROUPS = ['7U','8U','9U','10U','11U','12U','13U','14U','15U','16U','17U','18U'];
+
+  function normalizeAge(raw) {
+    if (!raw) return '';
+    const n = raw.toString().replace(/[^0-9]/g,'');
+    if (!n) return raw;
+    const num = parseInt(n);
+    if (num >= 7 && num <= 18) return num + 'U';
+    return raw;
+  }
+
+  // Normalize DOB to YYYY-MM-DD for HTML date inputs
+  // Handles: M/D/YY, M/D/YYYY, MM/DD/YYYY, YYYY-MM-DD, MM-DD-YYYY
+  function normalizeDOB(raw) {
+    if (!raw) return '';
+    raw = raw.toString().trim();
+    // Already YYYY-MM-DD
+    if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+    // M/D/YY or M/D/YYYY or MM/DD/YYYY
+    const slashMatch = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+    if (slashMatch) {
+      let [_, m, d, y] = slashMatch;
+      if (y.length === 2) y = (parseInt(y) <= 30 ? '20' : '19') + y;
+      return `${y}-${m.padStart(2,'0')}-${d.padStart(2,'0')}`;
+    }
+    // MM-DD-YYYY
+    const dashMatch = raw.match(/^(\d{1,2})-(\d{1,2})-(\d{4})$/);
+    if (dashMatch) {
+      let [_, m, d, y] = dashMatch;
+      return `${y}-${m.padStart(2,'0')}-${d.padStart(2,'0')}`;
+    }
+    return raw; // return as-is if unrecognized
+  }
+
+  // Format DOB for display (YYYY-MM-DD -> M/D/YYYY)
+  function formatDOB(raw) {
+    if (!raw) return '';
+    const m = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (m) return `${parseInt(m[2])}/${parseInt(m[3])}/${m[1]}`;
+    return raw;
+  }
+
+  let coaches  = [];
+  let players  = [];
+  let scores   = {};   // scores[pid][cid][skillKey|'notes']
+  let activeCoach   = null;
+  let currentEvalPid = null;
+  let saveTimer = null;
+  let unsubscribers = [];
+
+  // ── Firestore helpers ────────────────────────────────────────────────────
+  async function loadAll() {
+    showLoading(true);
+    try {
+      // Load coaches
+      const cSnap = await getDocs(collection(db, 'coaches'));
+      coaches = [];
+      cSnap.forEach(d => coaches.push({ id: d.id, ...d.data() }));
+      // Only seed default coaches if the database has NO coaches at all
+      if (!coaches.length) {
+        const defaults = [
+          { name: 'Wes Borden',   color: '#1a56db' },
+          { name: 'Nic Robinson', color: '#1565c0' },
+          { name: 'Jack Hall',    color: '#2e7d32' },
+          { name: 'Other',        color: '#6a1b9a' },
+        ];
+        for (const c of defaults) {
+          const id = 'c' + Date.now() + Math.random().toString(36).slice(-4);
+          await setDoc(doc(db, 'coaches', id), c);
+          coaches.push({ id, ...c });
+        }
+      }
+
+      // Load players
+      const pSnap = await getDocs(collection(db, 'players'));
+      players = [];
+      pSnap.forEach(d => players.push({ id: d.id, ...d.data() }));
+
+      // Load scores
+      const sSnap = await getDocs(collection(db, 'scores'));
+      scores = {};
+      sSnap.forEach(d => {
+        const [pid, cid] = d.id.split('__');
+        if (!scores[pid]) scores[pid] = {};
+        scores[pid][cid] = d.data();
+      });
+
+      showLoading(false);
+      await loadFavorites();
+      renderLogin();
+      startListeners();
+    } catch (e) {
+      console.error(e);
+      document.getElementById('loading-msg').textContent = 'Connection error. Check your Firebase config.';
+    }
+  }
+
+  function startListeners() {
+    // Live scores listener — updates results in real time
+    const unsub1 = onSnapshot(collection(db, 'scores'), snap => {
+      snap.docChanges().forEach(change => {
+        const [pid, cid] = change.doc.id.split('__');
+        if (!scores[pid]) scores[pid] = {};
+        if (change.type === 'removed') {
+          delete scores[pid][cid];
+        } else {
+          scores[pid][cid] = change.doc.data();
+        }
+      });
+      if (document.getElementById('tab-results').classList.contains('active')) {
+        renderSummary(); renderResults();
+      }
+    });
+
+    // Live players listener
+    const unsub2 = onSnapshot(collection(db, 'players'), snap => {
+      snap.docChanges().forEach(change => {
+        if (change.type === 'removed') {
+          players = players.filter(p => p.id !== change.doc.id);
+        } else {
+          const idx = players.findIndex(p => p.id === change.doc.id);
+          const data = { id: change.doc.id, ...change.doc.data() };
+          if (idx >= 0) players[idx] = data; else players.push(data);
+        }
+      });
+      if (document.getElementById('tab-roster').classList.contains('active')) renderRoster();
+      if (document.getElementById('tab-eval').classList.contains('active')) renderEvalPicker();
+    });
+
+    // Live coaches listener
+    const unsub3 = onSnapshot(collection(db, 'coaches'), snap => {
+      snap.docChanges().forEach(change => {
+        if (change.type === 'removed') {
+          coaches = coaches.filter(c => c.id !== change.doc.id);
+        } else {
+          const idx = coaches.findIndex(c => c.id === change.doc.id);
+          const data = { id: change.doc.id, ...change.doc.data() };
+          if (idx >= 0) coaches[idx] = data; else coaches.push(data);
+        }
+      });
+      // Re-render login screen if it's visible so new coaches appear
+      if (document.getElementById('screen-login').style.display !== 'none') {
+        renderLogin();
+      }
+    });
+
+    unsubscribers = [unsub1, unsub2, unsub3];
+  }
+
+  async function saveScore(pid, cid) {
+    const data = scores[pid] && scores[pid][cid] ? { ...scores[pid][cid] } : {};
+    await setDoc(doc(db, 'scores', `${pid}__${cid}`), data);
+    flashSave();
+  }
+
+  function scheduleSave(pid, cid) {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => saveScore(pid, cid), 350);
+  }
+
+  function flashSave() {
+    const el = document.getElementById('save-ind');
+    el.style.opacity = '1';
+    setTimeout(() => el.style.opacity = '0', 1500);
+  }
+
+  function showLoading(on) {
+    document.getElementById('screen-loading').style.display = on ? 'flex' : 'none';
+    document.getElementById('screen-login').style.display = on ? 'none' : 'block';
+  }
+
+  function newId(prefix) {
+    return prefix + Date.now().toString(36) + Math.random().toString(36).slice(-4);
+  }
+
+  // ── Login ────────────────────────────────────────────────────────────────
+  function renderLogin() {
+    document.getElementById('screen-login').style.display = 'block';
+    document.getElementById('screen-main').style.display = 'none';
+    const el = document.getElementById('coach-list');
+    if (!coaches.length) { el.innerHTML = '<p class="empty">No coaches yet — add one below.</p>'; return; }
+    el.innerHTML = coaches.map(c => {
+      const ini = c.name.split(' ').map(w => w[0]).join('').toUpperCase().slice(0,2);
+      return `<button class="coach-btn" onclick="loginAs('${c.id}')">
+        <div class="cavatar" style="background:${c.color}22;color:${c.color}">${ini}</div>
+        <div>
+          <div class="coach-btn-name">${c.name}</div>
+          <div class="coach-btn-role">Tap to score</div>
+        </div>
+      </button>`;
+    }).join('');
+  }
+
+  window.addCoach = async function() {
+    const inp = document.getElementById('new-coach-input');
+    const name = inp.value.trim(); if (!name) return;
+    const id = newId('c');
+    const color = PALETTE[coaches.length % PALETTE.length];
+    await setDoc(doc(db, 'coaches', id), { name, color });
+    // Don't push locally — onSnapshot listener handles it
+    inp.value = '';
+  };
+
+  window.loginAs = function(id) {
+    activeCoach = coaches.find(c => c.id === id);
+    document.getElementById('screen-login').style.display = 'none';
+    document.getElementById('screen-main').style.display = 'block';
+    document.getElementById('coach-label').textContent = activeCoach.name;
+    document.getElementById('coach-dot').style.background = activeCoach.color;
+    document.getElementById('hdr-sub').textContent = 'Scoring as ' + activeCoach.name;
+    gotoTab('roster');
+  };
+
+  window.switchCoach = function() {
+    activeCoach = null;
+    renderLogin();
+  };
+
+  // ── Roster ───────────────────────────────────────────────────────────────
+  window.toggleAddForm = function() {
+    const f = document.getElementById('add-form');
+    f.style.display = f.style.display === 'none' ? 'block' : 'none';
+  };
+
+  let addPhotoBase64 = null;
+  let editPhotoBase64 = null;
+
+  window.previewEditPhoto = function(e) {
+    const file = e.target.files[0]; if (!file) return;
+    compressImage(file, 400, 0.7, base64 => {
+      editPhotoBase64 = base64;
+      const prev = document.getElementById('edit-photo-preview');
+      if (prev) prev.innerHTML = `<img src="${base64}" style="width:100%;height:100%;object-fit:cover">`;
+    });
+  };
+
+  window.enlargePhoto = function(pid) {
+    const p = players.find(x => x.id === pid);
+    if (!p || !p.photo) return;
+    const lb = document.getElementById('photo-lightbox');
+    const img = document.getElementById('lightbox-img');
+    img.src = p.photo;
+    lb.style.display = 'flex';
+  };
+
+  window.closeLightbox = function() {
+    document.getElementById('photo-lightbox').style.display = 'none';
+  };
+
+  window.replaceEvalPhoto = function(pid) {
+    const inp = document.getElementById('eval-photo-file-' + pid);
+    if (inp) inp.click();
+  };
+
+  window.handleEvalPhotoReplace = async function(pid, e) {
+    const file = e.target.files[0]; if (!file) return;
+    compressImage(file, 400, 0.7, async base64 => {
+      const p = players.find(x => x.id === pid);
+      if (!p) return;
+      p.photo = base64;
+      await setDoc(doc(db, 'players', pid), { ...p });
+      flashSave();
+      renderEvalForm();
+    });
+  };
+
+  function compressImage(file, maxW, quality, cb) {
+    const reader = new FileReader();
+    reader.onload = ev => {
+      const img = new Image();
+      img.onload = () => {
+        const scale = Math.min(1, maxW / Math.max(img.width, img.height));
+        const canvas = document.createElement('canvas');
+        canvas.width  = Math.round(img.width  * scale);
+        canvas.height = Math.round(img.height * scale);
+        canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+        cb(canvas.toDataURL('image/jpeg', quality));
+      };
+      img.src = ev.target.result;
+    };
+    reader.readAsDataURL(file);
+  }
+
+  window.previewAddPhoto = function(e) {
+    const file = e.target.files[0]; if (!file) return;
+    compressImage(file, 400, 0.7, base64 => {
+      addPhotoBase64 = base64;
+      const prev = document.getElementById('add-photo-preview');
+      if (prev) prev.innerHTML = `<img src="${base64}" style="width:100%;height:100%;object-fit:cover">`;
+    });
+  };
+
+  window.addPlayer = async function() {
+    const first = document.getElementById('ff').value.trim();
+    const last  = document.getElementById('fl').value.trim();
+    if (!first || !last) { alert('First and last name required'); return; }
+    const id = newId('p');
+    const data = {
+      first, last,
+      dob:   normalizeDOB(document.getElementById('fdob').value.trim()),
+      email: document.getElementById('femail').value.trim(),
+      age:   normalizeAge(document.getElementById('fa').value.trim()),
+      num:   document.getElementById('fg2').value.trim(),
+      pos:   document.getElementById('fp').value,
+      pos2:  document.getElementById('fp2').value,
+      photo: addPhotoBase64 || '',
+      group: '',
+      notes: '',
+      createdAt: Date.now()
+    };
+    await setDoc(doc(db, 'players', id), data);
+    // Don't push locally — onSnapshot listener will add it and re-render
+    ['ff','fl','fa','fn','fg2','fdob','femail'].forEach(x => { const el=document.getElementById(x); if(el) el.value=''; });
+    document.getElementById('fp').value = '';
+    document.getElementById('fp2').value = '';
+    addPhotoBase64 = null;
+    const prev = document.getElementById('add-photo-preview');
+    if (prev) prev.innerHTML = '📷';
+    toggleAddForm();
+  };
+
+  window.removePlayer = async function(id) {
+    if (!confirm('Remove this player and all their scores?')) return;
+    await deleteDoc(doc(db, 'players', id));
+    // Remove all score docs for this player
+    for (const c of coaches) {
+      try { await deleteDoc(doc(db, 'scores', `${id}__${c.id}`)); } catch(e){}
+    }
+    players = players.filter(p => p.id !== id);
+    delete scores[id];
+    renderRoster();
+  };
+
+  window.openEditPlayer = function(pid) {
+    const p = players.find(x => x.id === pid);
+    if (!p) return;
+    editPhotoBase64 = null;
+    const posOpts = ['','Pitcher','Catcher','1B','2B','3B','SS','OF','INF','Utility','Unknown'];
+    const selOpt = (val) => posOpts.map(o => `<option value="${o}" ${o===val?'selected':''}>${o||'Select...'}</option>`).join('');
+    document.getElementById('edit-modal-body').innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+        <div style="font-size:16px;font-weight:600;color:var(--txt)">Edit Player</div>
+        <button class="btn sm del" onclick="closeEditModal()" style="font-size:16px;padding:2px 8px">✕</button>
+      </div>
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
+        <div id="edit-photo-preview" style="width:72px;height:72px;border-radius:var(--radius);overflow:hidden;border:0.5px solid var(--bdr2);cursor:pointer;display:flex;align-items:center;justify-content:center;background:var(--bg2);font-size:28px" onclick="document.getElementById('edit-photo-inp').click()">
+          ${p.photo ? `<img src="${p.photo}" style="width:100%;height:100%;object-fit:cover">` : '📷'}
+        </div>
+        <div style="font-size:12px;color:var(--txt2)">Tap photo to change</div>
+        <input type="file" id="edit-photo-inp" accept="image/*" capture="environment" style="display:none" onchange="previewEditPhoto(event)">
+      </div>
+      <div class="frow c4" style="margin-bottom:8px">
+        <div class="fg"><label>First name</label><input id="ef-first" type="text" value="${p.first}"></div>
+        <div class="fg"><label>Last name</label><input id="ef-last" type="text" value="${p.last}"></div>
+        <div class="fg"><label>Date of birth</label><input id="ef-dob" type="date" value="${normalizeDOB(p.dob||'')}" style="width:100%;padding:6px 8px;font-size:13px;border:0.5px solid var(--bdr2);border-radius:var(--radius-sm);background:var(--bg);color:var(--txt)"></div>
+        <div class="fg"><label>Email</label><input id="ef-email" type="email" value="${p.email||''}" placeholder="player@email.com"></div>
+      </div>
+      <div class="frow c4" style="margin-bottom:8px">
+        <div class="fg"><label>Age group</label>
+          <select id="ef-age" style="width:100%;padding:6px 8px;font-size:13px;border:0.5px solid var(--bdr2);border-radius:var(--radius-sm);background:var(--bg);color:var(--txt)">
+            <option value="">Select...</option>
+            ${ ['7U','8U','9U','10U','11U','12U','13U','14U','15U','16U','17U','18U'].map(a=>'<option value="'+a+'"'+(normalizeAge(p.age||'')===a?' selected':'')+'>'+a+'</option>').join('') }
+          </select>
+        </div>
+        <div class="fg"><label>Tryout #</label><input id="ef-num" type="text" value="${p.num||''}"></div>
+        <div class="fg"><label>Primary position</label><select id="ef-pos">${selOpt(p.pos||'')}</select></div>
+        <div class="fg"><label>Secondary position</label><select id="ef-pos2">${selOpt(p.pos2||'')}</select></div>
+      </div>
+      <div style="display:flex;gap:8px;justify-content:flex-end">
+        <button class="btn" onclick="closeEditModal()">Cancel</button>
+        <button class="btn pri" onclick="saveEditPlayer('${pid}')">Save changes</button>
+      </div>`;
+    document.getElementById('edit-modal-overlay').style.display = 'flex';
+  };
+
+  window.closeEditModal = function() {
+    document.getElementById('edit-modal-overlay').style.display = 'none';
+  };
+
+  window.saveEditPlayer = async function(pid) {
+    const p = players.find(x => x.id === pid);
+    if (!p) return;
+    const first = document.getElementById('ef-first').value.trim();
+    const last  = document.getElementById('ef-last').value.trim();
+    if (!first || !last) { alert('Name required'); return; }
+    const updates = {
+      first, last,
+      dob:   normalizeDOB(document.getElementById('ef-dob').value.trim()),
+      email: document.getElementById('ef-email').value.trim(),
+      age:   normalizeAge(document.getElementById('ef-age').value.trim()),
+      num:   document.getElementById('ef-num').value.trim(),
+      pos:   document.getElementById('ef-pos').value,
+      pos2:  document.getElementById('ef-pos2').value,
+      photo: editPhotoBase64 !== null ? editPhotoBase64 : (p.photo || ''),
+    };
+    Object.assign(p, updates);
+    closeEditModal(); // Close first before async
+    flashSave();
+    await setDoc(doc(db, 'players', pid), { ...p });
+    // renderRoster called by onSnapshot listener
+  };
+
+  window.importCSV = function(e) {
+    const file = e.target.files[0]; if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async ev => {
+      const lines = ev.target.result.trim().split('\n');
+      if (lines.length < 2) { alert('Empty CSV'); return; }
+      // Parse CSV line properly handling quoted fields with commas
+      function parseCSVLine(line) {
+        const result = [];
+        let cur = '', inQuote = false;
+        for (let i = 0; i < line.length; i++) {
+          const ch = line[i];
+          if (ch === '"') {
+            if (inQuote && line[i+1] === '"') { cur += '"'; i++; }
+            else inQuote = !inQuote;
+          } else if (ch === ',' && !inQuote) {
+            result.push(cur.trim()); cur = '';
+          } else {
+            cur += ch;
+          }
+        }
+        result.push(cur.trim());
+        return result;
+      }
+      const rawHdrs = parseCSVLine(lines[0]);
+      const hdrs = rawHdrs.map(h => h.trim().toLowerCase().replace(/[^a-z0-9]/g,''));
+      const get = (row, aliases) => {
+        for (const a of aliases) {
+          const i = hdrs.indexOf(a);
+          if (i >= 0 && row[i] !== undefined && row[i].trim()) return row[i].trim().replace(/^"|"$/g,'');
+        }
+        return '';
+      };
+      let added = 0, skipped = 0, updated = 0;
+      for (let i = 1; i < lines.length; i++) {
+        const row = parseCSVLine(lines[i]);
+        let first = get(row, ['first','firstname','fname','givenname']);
+        let last  = get(row, ['last','lastname','lname','surname','familyname']);
+        const full = get(row, ['name','playername','fullname','studentname']);
+        if (!first && !last && full) {
+          const parts = full.split(' ');
+          first = parts[0];
+          last = parts.slice(1).join(' ');
+        }
+        if (!first || !last) continue;
+
+        const dob   = normalizeDOB(get(row, ['dob','dateofbirth','birthdate','birthday','born','dateofbirth']));
+        const email = get(row, ['email','emailaddress','mail','parentemail','accountemail','emailaddress','guardianemail','contactemail']);
+        const age   = normalizeAge(get(row, ['age','agegroup','division','gradyear','agegroupdivision']));
+        const num   = get(row, ['number','num','jersey','jerseynumber','tryoutnumber','tryout','playernumber','uniformnumber']);
+        const pos   = get(row, ['position','pos','primaryposition','playerposition']);
+        const pos2  = get(row, ['position2','pos2','secondaryposition','secondary','alternateposition']);
+
+        // ── Duplicate check: same first+last name AND same DOB (if DOB present) ──
+        // Normalize both sides so format differences (1/9/16 vs 2016-01-09) don't cause false misses
+        // Find matching existing player (normalize both sides for comparison)
+        const existingPlayer = players.find(p => {
+          const nameMatch = p.first.toLowerCase().trim() === first.toLowerCase().trim() &&
+                            p.last.toLowerCase().trim()  === last.toLowerCase().trim();
+          if (!nameMatch) return false;
+          const incomingDob = dob ? normalizeDOB(dob) : '';
+          const existingDob = p.dob ? normalizeDOB(p.dob) : '';
+          if (incomingDob && existingDob) return incomingDob === existingDob;
+          return true;
+        });
+
+        if (existingPlayer) {
+          // Player exists — check if incoming data fills any empty fields
+          const updates = {};
+          if (!existingPlayer.dob   && dob)   updates.dob   = normalizeDOB(dob);
+          if (!existingPlayer.email && email)  updates.email = email;
+          if (!existingPlayer.num   && num)    updates.num   = num;
+          if (!existingPlayer.age   && age)    updates.age   = age;
+          if (!existingPlayer.pos   && pos)    updates.pos   = pos;
+          if (!existingPlayer.pos2  && pos2)   updates.pos2  = pos2;
+          if (Object.keys(updates).length > 0) {
+            Object.assign(existingPlayer, updates);
+            await setDoc(doc(db, 'players', existingPlayer.id), { ...existingPlayer });
+            updated++;
+          } else {
+            skipped++;
+          }
+          continue;
+        }
+
+        const id = newId('p');
+        const data = {
+          first, last,
+          dob:   normalizeDOB(dob), email, age, num, pos, pos2,
+          photo: '', group: '', notes: '',
+          createdAt: Date.now()
+        };
+        await setDoc(doc(db, 'players', id), data);
+        added++;
+      }
+      e.target.value = '';
+      const parts = [];
+      if (added > 0)   parts.push(`${added} player${added !== 1 ? 's' : ''} added`);
+      if (updated > 0) parts.push(`${updated} player${updated !== 1 ? 's' : ''} updated with new info`);
+      if (skipped > 0) parts.push(`${skipped} already up to date`);
+      alert(parts.length ? parts.join('\n') : 'No changes made.');
+    };
+    reader.readAsText(file);
+  };
+
+  function populateAgeDropdown(selectId) {
+    const sel = document.getElementById(selectId);
+    if (!sel) return;
+    const current = sel.value;
+    const ages = [...new Set(players.map(p => p.age).filter(Boolean))].sort();
+    sel.innerHTML = '<option value="">All ages</option>' + ages.map(a => `<option value="${a}" ${a===current?'selected':''}>${a}</option>`).join('');
+  }
+
+  function applyListFiltersAndSort(players, searchId, ageId, sortId) {
+    const q = (document.getElementById(searchId)?.value || '').toLowerCase();
+    const age = document.getElementById(ageId)?.value || '';
+    const sort = document.getElementById(sortId)?.value || 'name';
+    let list = players.filter(p => {
+      const matchQ = `${p.first} ${p.last} ${p.num} ${p.pos}`.toLowerCase().includes(q);
+      const matchAge = !age || p.age === age;
+      return matchQ && matchAge;
+    });
+    if (sort === 'tryout') list.sort((a,b) => (parseInt(a.num)||999) - (parseInt(b.num)||999));
+    else if (sort === 'age') list.sort((a,b) => (a.age||'').localeCompare(b.age||''));
+    else list.sort((a,b) => `${a.last}${a.first}`.localeCompare(`${b.last}${b.first}`));
+    return list;
+  }
+
+  function renderRoster() {
+    populateAgeDropdown('r-age');
+    const el = document.getElementById('roster-list');
+    const list = applyListFiltersAndSort(players, 'r-srch', 'r-age', 'r-sort');
+    if (!list.length) { el.innerHTML = '<p class="empty">No players match. Try clearing the filters.</p>'; return; }
+    el.innerHTML = list.map(p => {
+      const myScored = activeCoach && scores[p.id] && scores[p.id][activeCoach.id] && SK.some(k => scores[p.id][activeCoach.id][k]);
+      const coachCount = coaches.filter(c => scores[p.id] && scores[p.id][c.id] && SK.some(k => scores[p.id][c.id][k])).length;
+      const posDisplay = [p.pos, p.pos2].filter(Boolean).join(' / ');
+      const photoHtml = p.photo
+        ? `<img src="${p.photo}" style="width:36px;height:36px;border-radius:50%;object-fit:cover;border:0.5px solid var(--bdr);flex-shrink:0">`
+        : `<div style="width:36px;height:36px;border-radius:50%;background:var(--bg2);border:0.5px solid var(--bdr);display:flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0">${p.first[0]}${p.last[0]}</div>`;
+      const isSelected = selectedIds.has(p.id);
+      const ageText = `<div style="font-size:14px;font-weight:600;color:var(--txt);min-width:36px;text-align:center">${p.age||'—'}</div>`;
+      const tryoutBadge = p.num ? `<div style="width:36px;height:36px;border-radius:6px;background:var(--red);color:#fff;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;flex-shrink:0;letter-spacing:-.3px">${p.num}</div>` : `<div style="width:36px;height:36px;border-radius:6px;background:var(--bg3);border:0.5px solid var(--bdr);flex-shrink:0"></div>`;
+      return `<div class="prow" style="cursor:pointer;grid-template-columns:32px 36px 36px 36px 1fr auto auto auto auto;background:${isSelected?'var(--blue-bg)':'var(--bg)'};border-color:${isSelected?'#1565c0':'var(--bdr)'}" onclick="openEditPlayer('${p.id}')">
+        <div onclick="event.stopPropagation();toggleSelect('${p.id}')" style="display:flex;align-items:center;justify-content:center">
+          <input type="checkbox" ${isSelected?'checked':''} onclick="event.stopPropagation();toggleSelect('${p.id}')" style="width:16px;height:16px;cursor:pointer">
+        </div>
+        ${ageText}
+        ${tryoutBadge}
+        ${photoHtml}
+        <div style="display:flex;align-items:center;gap:4px;min-width:0">
+          <div style="min-width:0">
+            <div style="display:flex;align-items:center;gap:4px">
+              <div class="pname">${p.first} ${p.last}</div>
+              ${starIcon(p.id)}
+            </div>
+            <div class="pmeta">${[posDisplay, p.dob ? 'DOB: '+formatDOB(p.dob) : '', p.email].filter(Boolean).join(' · ')}</div>
+          </div>
+        </div>
+        <button onclick="event.stopPropagation();openEval('${p.id}')" style="background:var(--red);color:#fff;border:none;border-radius:var(--radius-sm);padding:0 18px;height:44px;font-size:14px;font-weight:600;cursor:pointer;flex-shrink:0;-webkit-tap-highlight-color:transparent">Evaluate</button>
+        <div class="pbadges">
+          ${myScored ? '<span class="badge bgn">Scored by me</span>' : '<span class="badge bgr">Pending</span>'}
+          ${coachCount ? `<span class="badge bbl">${coachCount}/${coaches.length} coaches</span>` : ''}
+        </div>
+        <div class="pactions">
+          <button class="btn sm del" onclick="event.stopPropagation();removePlayer('${p.id}')">✕</button>
+        </div>
+      </div>`;
+    }).join('');
+    updateBulkBar();
+  }
+
+  // ── Eval picker ──────────────────────────────────────────────────────────
+  function renderEvalPicker() {
+    populateAgeDropdown('ep-age');
+    const filter = document.getElementById('ep-filter').value;
+    const el     = document.getElementById('eval-list');
+    let list = applyListFiltersAndSort(players, 'ep-srch', 'ep-age', 'ep-sort');
+    if (filter === 'pending') list = list.filter(p => !activeCoach || !scores[p.id] || !scores[p.id][activeCoach.id] || !SK.some(k => scores[p.id][activeCoach.id][k]));
+    if (filter === 'done')    list = list.filter(p => activeCoach && scores[p.id] && scores[p.id][activeCoach.id] && SK.some(k => scores[p.id][activeCoach.id][k]));
+    if (!list.length) { el.innerHTML = '<p class="empty">No players match.</p>'; return; }
+    el.innerHTML = list.map(p => {
+      const myScored = activeCoach && scores[p.id] && scores[p.id][activeCoach.id] && SK.some(k => scores[p.id][activeCoach.id][k]);
+      const posLine = [p.pos, p.pos2].filter(Boolean).join(' / ');
+      const ageTextE = `<div style="font-size:14px;font-weight:600;color:var(--txt);min-width:36px;text-align:center">${p.age||'—'}</div>`;
+      const tryoutBadgeE = p.num ? `<div style="width:36px;height:36px;border-radius:6px;background:var(--red);color:#fff;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;flex-shrink:0">${p.num}</div>` : `<div style="width:36px;height:36px;border-radius:6px;background:var(--bg3);border:0.5px solid var(--bdr);flex-shrink:0"></div>`;
+      const photoHtmlE = p.photo
+        ? `<img src="${p.photo}" style="width:36px;height:36px;border-radius:50%;object-fit:cover;border:0.5px solid var(--bdr);flex-shrink:0">`
+        : `<div style="width:36px;height:36px;border-radius:50%;background:var(--bg2);border:0.5px solid var(--bdr);display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:600;color:var(--txt2);flex-shrink:0">${p.first[0]}${p.last[0]}</div>`;
+      const myScoreE = (function(){
+        if(!activeCoach||!scores[p.id]||!scores[p.id][activeCoach.id])return'—';
+        const cs=scores[p.id][activeCoach.id];
+        let ws=0,wu=0;
+        SK.forEach(k=>{const v=cs[k];if(!v)return;const w=WEIGHTS[k]||(1/SK.length);ws+=v*w;wu+=w;});
+        return wu?(ws/wu).toFixed(1):'—';
+      })();
+      return `<div class="prow" style="cursor:pointer;grid-template-columns:36px 36px 36px 1fr auto auto" onclick="openEval('${p.id}')">
+        ${ageTextE}
+        ${tryoutBadgeE}
+        ${photoHtmlE}
+        <div>
+          <div class="pname">${p.first} ${p.last}</div>
+          <div class="pmeta">${posLine || '—'}</div>
+        </div>
+        <div>${myScored ? '<span class="badge bgn">Scored</span>' : '<span class="badge bgr">Pending</span>'}</div>
+        <div style="font-size:13px;font-weight:600;color:var(--txt);min-width:32px;text-align:right">${myScoreE}</div>
+      </div>`;
+    }).join('');
+  }
+
+  window.openEval = function(pid) {
+    currentEvalPid = pid;
+    document.getElementById('roster-list').style.display = 'none';
+    document.getElementById('eval-form-wrap').style.display = 'block';
+    const bb = document.getElementById('bulk-bar');
+    if (bb) bb.style.display = 'none';
+    // Hide roster toolbar
+    const rt = document.querySelector('#tab-roster .toolbar');
+    if (rt) rt.style.display = 'none';
+    const addF = document.getElementById('add-form');
+    if (addF) addF.style.display = 'none';
+    renderEvalForm();
+    closeDrawer();
+  };
+
+  window.openDrawer = function() {
+    renderDrawer();
+    const drawer = document.getElementById('player-drawer');
+    const panel  = document.getElementById('drawer-panel');
+    drawer.style.display = 'block';
+    requestAnimationFrame(() => { panel.style.transform = 'translateX(0)'; });
+  };
+
+  window.closeDrawer = function() {
+    const panel = document.getElementById('drawer-panel');
+    if (!panel) return;
+    panel.style.transform = 'translateX(-100%)';
+    setTimeout(() => {
+      const drawer = document.getElementById('player-drawer');
+      if (drawer) drawer.style.display = 'none';
+    }, 260);
+  };
+
+  // Drawer age filter state (set of selected age groups, empty = all)
+  let drawerAgeFilter = new Set();
+
+  window.toggleDrawerAgeMenu = function(e) {
+    if (e) e.stopPropagation();
+    const menu = document.getElementById('drawer-age-menu');
+    const btn  = document.getElementById('drawer-age-btn');
+    const wrap = document.getElementById('drawer-age-wrap');
+    if (!menu) return;
+    if (menu.style.display !== 'none') { menu.style.display = 'none'; return; }
+    // Build age group checkboxes from players
+    const ages = [...new Set(players.map(p => p.age).filter(Boolean))].sort();
+    menu.innerHTML = `
+      <div style="padding:4px 8px;font-size:11px;font-weight:600;color:var(--txt2);border-bottom:0.5px solid var(--bdr);margin-bottom:4px">Filter by age</div>
+      <label style="display:flex;align-items:center;gap:8px;padding:5px 8px;cursor:pointer;font-size:13px;color:var(--txt)" onclick="event.stopPropagation()">
+        <input type="checkbox" ${drawerAgeFilter.size===0?'checked':''} onchange="drawerAgeSelectAll(this,event)" style="width:15px;height:15px"> All ages
+      </label>
+      ${ages.map(a => `<label style="display:flex;align-items:center;gap:8px;padding:5px 8px;cursor:pointer;font-size:13px;color:var(--txt)" onclick="event.stopPropagation()">
+        <input type="checkbox" value="${a}" ${drawerAgeFilter.has(a)?'checked':''} onchange="drawerAgeToggle('${a}',this,event)" style="width:15px;height:15px"> ${a}
+      </label>`).join('')}`;
+    // Position menu below button
+    const rect = wrap.getBoundingClientRect();
+    menu.style.top  = (rect.bottom + 4) + 'px';
+    menu.style.left = rect.left + 'px';
+    menu.style.display = 'block';
+    // Close on outside click
+    setTimeout(() => document.addEventListener('click', closeDrawerAgeMenu, { once: true }), 10);
+  };
+
+  function closeDrawerAgeMenu() {
+    const menu = document.getElementById('drawer-age-menu');
+    if (menu) menu.style.display = 'none';
+  }
+
+  window.drawerAgeSelectAll = function(cb, e) {
+    if (e) e.stopPropagation();
+    drawerAgeFilter.clear();
+    document.querySelectorAll('#drawer-age-menu input[type=checkbox][value]').forEach(el => el.checked = false);
+    cb.checked = true;
+    updateDrawerAgeBtn();
+    renderDrawer();
+  };
+
+  window.drawerAgeToggle = function(age, cb, e) {
+    if (e) e.stopPropagation(); // prevent menu close
+    if (cb.checked) drawerAgeFilter.add(age);
+    else drawerAgeFilter.delete(age);
+    const allCb = document.querySelector('#drawer-age-menu input[type=checkbox]:not([value])');
+    if (allCb) allCb.checked = drawerAgeFilter.size === 0;
+    updateDrawerAgeBtn();
+    renderDrawer();
+  };
+
+  function updateDrawerAgeBtn() {
+    const btn = document.getElementById('drawer-age-btn');
+    if (!btn) return;
+    btn.textContent = drawerAgeFilter.size > 0
+      ? [...drawerAgeFilter].sort().join(', ') + ' ▾'
+      : 'Ages ▾';
+    btn.style.color = drawerAgeFilter.size > 0 ? 'var(--red)' : 'var(--txt)';
+    btn.style.borderColor = drawerAgeFilter.size > 0 ? 'var(--red)' : 'var(--bdr2)';
+  }
+
+  window.renderDrawer = function() {
+    const sort = document.getElementById('drawer-sort')?.value || 'tryout';
+    let list = drawerAgeFilter.size > 0
+      ? players.filter(p => drawerAgeFilter.has(p.age))
+      : [...players];
+    if (sort === 'tryout') list.sort((a,b) => (parseInt(a.num)||999)-(parseInt(b.num)||999));
+    else if (sort === 'name') list.sort((a,b) => `${a.last}${a.first}`.localeCompare(`${b.last}${b.first}`));
+    else if (sort === 'age') list.sort((a,b) => (a.age||'').localeCompare(b.age||''));
+    const el = document.getElementById('drawer-list');
+    if (!el) return;
+    el.innerHTML = list.map(p => {
+      const isCurrent = p.id === currentEvalPid;
+      const myScored = activeCoach && scores[p.id] && scores[p.id][activeCoach.id] && SK.some(k => scores[p.id][activeCoach.id][k]);
+      // Show MY score in drawer, not aggregate
+      const myCs = activeCoach && scores[p.id] && scores[p.id][activeCoach.id] ? scores[p.id][activeCoach.id] : null;
+      const myVals = myCs ? SK.map(k=>myCs[k]||0).filter(v=>v>0) : [];
+      const pAvg = myVals.length ? (function(){let ws=0,wu=0;SK.forEach(k=>{const v=myCs[k];if(!v)return;const w=WEIGHTS[k]||(1/SK.length);ws+=v*w;wu+=w;});return wu?(ws/wu).toFixed(1):'—'})() : '—';
+      const avgColor = pAvg==='—' ? (isCurrent?'rgba(255,255,255,0.4)':'var(--txt3)') : isCurrent ? '#fff' : (parseFloat(pAvg)>=7.5?'#2e7d32':parseFloat(pAvg)>=5?'#f57f17':'#c62828');
+      const tryoutCircle = `<div style="width:42px;height:42px;border-radius:50%;background:${isCurrent?'rgba(255,255,255,0.25)':'var(--bg2)'};border:0.5px solid ${isCurrent?'rgba(255,255,255,0.35)':'var(--bdr)'};display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:700;color:${isCurrent?'#fff':'var(--txt)'};flex-shrink:0">${p.num||'—'}</div>`;
+      return `<div onclick="openEval('${p.id}')" style="display:flex;align-items:center;gap:10px;padding:10px 14px;cursor:pointer;border-bottom:0.5px solid var(--bdr);background:${isCurrent?'var(--red)':'transparent'};-webkit-tap-highlight-color:transparent">
+        ${tryoutCircle}
+        <div style="flex:1;min-width:0">
+          <div style="display:flex;align-items:center;gap:4px">
+            <div style="font-size:14px;font-weight:600;color:${isCurrent?'#fff':'var(--txt)'};white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${p.first} ${p.last}</div>
+            ${isFavorited(p.id)?`<span style="font-size:14px;color:${isCurrent?'#ffe082':'#f5a623'};line-height:1;flex-shrink:0">★</span>`:''}
+          </div>
+          <div style="font-size:11px;color:${isCurrent?'rgba(255,255,255,0.75)':'var(--txt2)'}">${[p.pos,p.pos2].filter(Boolean).join('/')||'—'} · ${p.age||'—'} ${myScored?'✓':''}</div>
+        </div>
+        <div style="width:50px;height:50px;border-radius:8px;background:${isCurrent?'rgba(255,255,255,0.2)':'var(--bg2)'};border:0.5px solid ${isCurrent?'rgba(255,255,255,0.3)':'var(--bdr)'};display:flex;align-items:center;justify-content:center;flex-shrink:0">
+          <span style="font-size:${pAvg==='—'?'11':'17'}px;font-weight:700;color:${avgColor};line-height:1">${pAvg}</span>
+        </div>
+      </div>`;
+    }).join('');
+    // Scroll current player into view
+    setTimeout(() => {
+      const items = el.querySelectorAll('div[style*="var(--red)"]');
+      if (items.length) items[0].scrollIntoView({block:'center'});
+    }, 50);
+  };
+
+  window.closeEval = function() {
+    closeDrawer();
+    document.getElementById('eval-form-wrap').style.display = 'none';
+    document.getElementById('roster-list').style.display = '';
+    // Restore roster toolbar
+    const rt = document.querySelector('#tab-roster .toolbar');
+    if (rt) rt.style.display = '';
+    updateBulkBar();
+    renderRoster();
+  };
+
+  // ── Eval form ────────────────────────────────────────────────────────────
+  function myWeightedAvg(cs) {
+    let wsum = 0, wused = 0;
+    SK.forEach(k => {
+      const v = cs[k];
+      if (!v) return; // skip unscored
+      const w = WEIGHTS[k] || (1/SK.length);
+      wsum += v * w; wused += w;
+    });
+    // Re-normalize by wused so unscored skills don't drag score down
+    return wused ? (wsum / wused).toFixed(1) : '—';
+  }
+
+  function renderEvalForm() {
+    const p = players.find(x => x.id === currentEvalPid);
+    if (!p || !activeCoach) return;
+    if (!scores[p.id]) scores[p.id] = {};
+    if (!scores[p.id][activeCoach.id]) scores[p.id][activeCoach.id] = {};
+    const cs = scores[p.id][activeCoach.id];
+    const idx = players.indexOf(p);
+
+    const scoreRow = (key, label) => {
+      const val = cs[key] || 0;
+      const btns = Array.from({length:10}, (_,i) =>
+        `<button class="sc${val > i ? ' on' : ''}" onclick="setScore('${p.id}','${key}',${i+1})">${i+1}</button>`
+      ).join('');
+      return `<div class="skill-item">
+        <div class="slbl">${label} <span class="sval" id="sv-${key}">${val ? val+'/10' : '—'}</span></div>
+        <div class="strack">${btns}</div>
+      </div>`;
+    };
+
+    const measRow = (m) => {
+      const readings = getMeasReadings(p.id, m.key);
+      const nums = readings.map(r => parseFloat(r)).filter(n => !isNaN(n));
+      const avg = nums.length ? (nums.reduce((a,b)=>a+b,0)/nums.length).toFixed(2) : null;
+      const readingsList = readings.length ? readings.map((r,i) =>
+        `<div class="mread-row"><span class="mread-val">${m.key==='pitchVelo'?Math.round(parseFloat(r)):parseFloat(r).toFixed(2)}</span><button class="mread-del" onclick="deleteMeasReading('${p.id}','${m.key}',${i})">✕</button></div>`
+      ).join('') : '<span style="font-size:12px;color:var(--txt3)">No readings yet</span>';
+      const avgText = nums.length ? `Avg: ${avg} (${nums.length} reading${nums.length>1?'s':''})` : '';
+
+      if (m.timer) {
+        const ts = timerState[m.key] || {};
+        const isRunning = ts.running || false;
+        return `<div class="meas-item">
+          <div class="slbl">${m.label} <span style="font-size:11px;color:var(--txt3)">${m.unit}</span></div>
+          <div class="timer-display" id="td-${m.key}">0.00s</div>
+          <div class="timer-btns">
+            <button class="timer-btn ${isRunning?'timer-stop':'timer-start'}" id="tb-${m.key}" onclick="timerToggle('${p.id}','${m.key}')">${isRunning?'⏹ Stop':'▶ Start'}</button>
+          </div>
+          <div id="mrl-${m.key}" class="mread-list">${readingsList}</div>
+          <div id="mra-${m.key}" class="mread-avg">${avgText}</div>
+        </div>`;
+      }
+      return `<div class="meas-item">
+        <div class="slbl">${m.label} <span style="font-size:11px;color:var(--txt3)">${m.unit}</span></div>
+        <button class="timer-btn timer-start" style="width:100%;margin-bottom:6px" onclick="openKeypad('${p.id}','${m.key}','${m.label}')">+ Add reading</button>
+        <div id="mrl-${m.key}" class="mread-list">${readingsList}</div>
+        <div id="mra-${m.key}" class="mread-avg">${avgText}</div>
+      </div>`;
+    };
+
+    const others = coaches.filter(c => c.id !== activeCoach.id && scores[p.id] && scores[p.id][c.id] && SK.some(k => scores[p.id][c.id][k]));
+    const othersHTML = others.length ? `
+      <hr class="divider">
+      <div class="other-title">Other coaches' scores</div>
+      ${others.map(c => {
+        const sc = scores[p.id][c.id];
+        const cavg = myWeightedAvg(sc);
+        const pills = SK.map((k,i) => sc[k] ? `<span class="cpill" style="background:${c.color}18;color:${c.color}">${SKILLS[i].split(' ')[0]}: ${sc[k]}</span>` : '').filter(Boolean).join('');
+        const measPills = MEAS_FIELDS.map(m => sc[m.key] ? `<span class="cpill" style="background:#88888818;color:var(--txt2)">${m.label.split(' ')[0]}: ${sc[m.key]}${m.unit}</span>` : '').filter(Boolean).join('');
+        return `<div class="other-row">
+          <span class="other-name" style="color:${c.color}">${c.name} <span class="other-avg">(${cavg})</span></span>
+          <div class="other-pills">${pills}${measPills}</div>
+        </div>`;
+      }).join('')}` : '';
+
+    document.getElementById('eval-form-wrap').innerHTML = `
+      <button onclick="openDrawer()" style="display:flex;align-items:center;justify-content:center;gap:8px;width:100%;margin-bottom:12px;padding:14px;font-size:16px;font-weight:700;border:none;border-radius:var(--radius-sm);background:var(--red);color:#fff;cursor:pointer;-webkit-tap-highlight-color:transparent">
+        <span style="font-size:20px">☰</span> Player Index
+      </button>
+      <div class="eval-card">
+        <div class="eval-hdr">
+          <div>
+            <div style="display:flex;align-items:center;gap:10px">
+          <div style="position:relative;flex-shrink:0">
+            ${p.photo
+              ? `<img src="${p.photo}" id="eval-photo-thumb" onclick="enlargePhoto('${p.id}')" style="width:52px;height:52px;border-radius:50%;object-fit:cover;border:0.5px solid var(--bdr);cursor:pointer">`
+              : `<div style="width:52px;height:52px;border-radius:50%;background:var(--bg2);border:0.5px solid var(--bdr);display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:600;color:var(--txt2)">${p.first[0]}${p.last[0]}</div>`
+            }
+            <button onclick="replaceEvalPhoto('${p.id}')" style="position:absolute;bottom:-2px;right:-4px;width:20px;height:20px;border-radius:50%;background:var(--red);border:none;color:#fff;font-size:10px;cursor:pointer;display:flex;align-items:center;justify-content:center" title="Replace photo">📷</button>
+            <input type="file" id="eval-photo-file-${p.id}" accept="image/*" capture="environment" style="display:none" onchange="handleEvalPhotoReplace('${p.id}',event)">
+          </div>
+          <div style="display:flex;align-items:center;gap:6px">
+            <div class="eval-pname">${p.first} ${p.last}</div>
+            <button class="eval-star-btn" onclick="toggleFavorite('${p.id}',event)" style="background:none;border:none;cursor:pointer;font-size:22px;padding:0;line-height:1;color:${isFavorited(p.id)?'#f5a623':'var(--txt3)'};-webkit-tap-highlight-color:transparent">${isFavorited(p.id)?'★':'☆'}</button>
+          </div>
+        </div>
+            <div class="eval-meta">Tryout #${p.num||'—'}${p.pos?' · '+p.pos:''}${p.pos2?' / '+p.pos2:''}${p.age?' · '+p.age:''}${p.dob?' · '+formatDOB(p.dob):''}${p.email?' · '+p.email:''}</div>
+            <div class="eval-coach-lbl" style="color:${activeCoach.color}">Scoring as ${activeCoach.name}</div>
+          </div>
+          <div class="eval-avg-block">
+            <div class="eval-avg-num" id="my-avg">${myWeightedAvg(cs)}</div>
+            <div class="eval-avg-sub">my weighted score</div>
+            <div class="eval-avg-sub" style="margin-top:2px">all coaches: ${aggAvg(p.id)}</div>
+          </div>
+        </div>
+
+        <div style="font-size:11px;font-weight:600;color:var(--txt2);margin-bottom:8px;text-transform:uppercase;letter-spacing:.5px">Skill Scores</div>
+        <div class="skill-grid">
+          ${SK.map((k,i) => scoreRow(k, SKILLS[i])).join('')}
+        </div>
+
+        <hr class="divider">
+        <div style="font-size:11px;font-weight:600;color:var(--txt2);margin-bottom:8px;text-transform:uppercase;letter-spacing:.5px">Measurements</div>
+        <div class="meas-grid">
+          ${MEAS_FIELDS.map(m => measRow(m)).join('')}
+        </div>
+
+        <hr class="divider">
+        <div class="notes-wrap">
+          <label class="notes-lbl">My notes for ${p.first}</label>
+          <textarea id="my-notes" class="notes-ta" onchange="saveNotesNow('${p.id}')" onblur="saveNotesNow('${p.id}')" placeholder="Mechanics, attitude, standout moments...">${cs.notes || ''}</textarea>
+        </div>
+        ${othersHTML}
+        <div class="eval-nav">
+          <button class="btn" onclick="closeEval()">← Back</button>
+          <div class="eval-nav-r">
+            <span class="eval-prog">${idx+1} of ${players.length}</span>
+            ${idx < players.length-1 ? `<button class="btn pri" onclick="nextPlayer()">Next →</button>` : ''}
+          </div>
+        </div>
+      </div>`;
+  }
+
+  window.setScore = function(pid, key, val) {
+    if (!activeCoach) return;
+    if (!scores[pid]) scores[pid] = {};
+    if (!scores[pid][activeCoach.id]) scores[pid][activeCoach.id] = {};
+
+    // Toggle off if same button clicked again
+    const current = scores[pid][activeCoach.id][key];
+    const newVal = (current === val) ? null : val;
+    scores[pid][activeCoach.id][key] = newVal;
+
+    // Update buttons
+    const kidx = SK.indexOf(key);
+    const allTracks = document.querySelectorAll('.strack');
+    if (allTracks[kidx]) {
+      allTracks[kidx].querySelectorAll('.sc').forEach((sc,i) => {
+        sc.classList.toggle('on', newVal && i < newVal);
+      });
+    }
+    const svEl = document.getElementById('sv-' + key);
+    if (svEl) svEl.textContent = newVal ? newVal + '/10' : '—';
+
+    // Update my weighted avg display
+    const cs = scores[pid][activeCoach.id];
+    const avgEl = document.getElementById('my-avg');
+    if (avgEl) avgEl.textContent = myWeightedAvg(cs);
+
+    scheduleSave(pid, activeCoach.id);
+  };
+
+  window.setMeas = function(pid, key, val) {
+    if (!activeCoach) return;
+    if (!scores[pid]) scores[pid] = {};
+    if (!scores[pid][activeCoach.id]) scores[pid][activeCoach.id] = {};
+    scores[pid][activeCoach.id][key] = val;
+    scheduleSave(pid, activeCoach.id);
+  };
+
+  // ── Timer + multi-reading system ─────────────────────────────────────────
+  let timerRAF = {};
+
+  function getMeasReadings(pid, key) {
+    if (!activeCoach || !scores[pid] || !scores[pid][activeCoach.id]) return [];
+    const val = scores[pid][activeCoach.id][key];
+    if (!val) return [];
+    if (Array.isArray(val)) return val;
+    if (typeof val === 'string' && val !== '') return [val]; // legacy single
+    return [];
+  }
+
+  function saveMeasReadings(pid, key, readings) {
+    if (!activeCoach) return;
+    if (!scores[pid]) scores[pid] = {};
+    if (!scores[pid][activeCoach.id]) scores[pid][activeCoach.id] = {};
+    scores[pid][activeCoach.id][key] = readings;
+    scheduleSave(pid, activeCoach.id);
+  }
+
+  function refreshMeasUI(pid, key) {
+    const readings = getMeasReadings(pid, key);
+    const listEl = document.getElementById('mrl-' + key);
+    const avgEl  = document.getElementById('mra-' + key);
+    if (listEl) {
+      listEl.innerHTML = readings.length ? readings.map((r,i) =>
+        `<div class="mread-row">
+          <span class="mread-val">${key==="pitchVelo"?Math.round(parseFloat(r)):parseFloat(r).toFixed(2)}</span>
+          <button class="mread-del" onclick="deleteMeasReading('${pid}','${key}',${i})">✕</button>
+        </div>`
+      ).join('') : '<span style="font-size:12px;color:var(--txt3)">No readings yet</span>';
+    }
+    if (avgEl) {
+      if (readings.length) {
+        const nums = readings.map(r => parseFloat(r)).filter(n => !isNaN(n));
+        const avg = nums.length ? (key==='pitchVelo' ? String(Math.round(nums.reduce((a,b)=>a+b,0)/nums.length)) : (nums.reduce((a,b)=>a+b,0)/nums.length).toFixed(2)) : '—';
+        avgEl.textContent = `Avg: ${avg} (${readings.length} reading${readings.length>1?'s':''})`;
+      } else {
+        avgEl.textContent = '';
+      }
+    }
+  }
+
+  window.deleteMeasReading = function(pid, key, idx) {
+    const readings = [...getMeasReadings(pid, key)];
+    readings.splice(idx, 1);
+    saveMeasReadings(pid, key, readings);
+    refreshMeasUI(pid, key);
+  };
+
+  window.timerToggle = function(pid, key) {
+    if (!timerState[key]) timerState[key] = { running: false, start: null };
+    const ts = timerState[key];
+    if (ts.running) {
+      const elapsed = Date.now() - ts.start;
+      ts.running = false;
+      cancelAnimationFrame(timerRAF[key]);
+      const secs = (elapsed / 1000).toFixed(2);
+      const readings = [...getMeasReadings(pid, key), secs];
+      saveMeasReadings(pid, key, readings);
+      const disp = document.getElementById('td-' + key);
+      if (disp) disp.textContent = secs + 's';
+      const btn = document.getElementById('tb-' + key);
+      if (btn) { btn.textContent = '▶ Start'; btn.className = 'timer-btn timer-start'; }
+      refreshMeasUI(pid, key);
+    } else {
+      ts.start = Date.now();
+      ts.running = true;
+      const btn = document.getElementById('tb-' + key);
+      if (btn) { btn.textContent = '⏹ Stop'; btn.className = 'timer-btn timer-stop'; }
+      const disp = document.getElementById('td-' + key);
+      if (disp) disp.textContent = '0.00s';
+      function tick() {
+        if (!timerState[key]?.running) return;
+        const el = Date.now() - timerState[key].start;
+        const d = document.getElementById('td-' + key);
+        if (d) d.textContent = (el/1000).toFixed(2) + 's';
+        timerRAF[key] = requestAnimationFrame(tick);
+      }
+      timerRAF[key] = requestAnimationFrame(tick);
+    }
+  };
+
+  window.timerReset = function(pid, key) {
+    cancelAnimationFrame(timerRAF[key]);
+    timerState[key] = { running: false, start: null };
+    const disp = document.getElementById('td-' + key);
+    if (disp) disp.textContent = '0.00s';
+    const btn = document.getElementById('tb-' + key);
+    if (btn) { btn.textContent = '▶ Start'; btn.className = 'timer-btn timer-start'; }
+  };
+
+  // ── Keypad ────────────────────────────────────────────────────────────────
+  window.openKeypad = function(pid, key, label) {
+    keypadState = { pid, key, buffer: '' };
+    document.getElementById('kp-title').textContent = label;
+    document.getElementById('kp-display').textContent = '0';
+    document.getElementById('kp-overlay').style.display = 'flex';
+  };
+
+  window.closeKeypad = function() {
+    document.getElementById('kp-overlay').style.display = 'none';
+    keypadState = { pid: null, key: null, buffer: '' };
+  };
+
+  window.kpPress = function(ch) {
+    if (ch === '.' && keypadState.buffer.includes('.')) return;
+    if (keypadState.buffer === '0' && ch !== '.') keypadState.buffer = ch;
+    else keypadState.buffer += ch;
+    if (keypadState.buffer === '') keypadState.buffer = '0';
+    document.getElementById('kp-display').textContent = keypadState.buffer || '0';
+  };
+
+  window.kpBackspace = function() {
+    keypadState.buffer = keypadState.buffer.slice(0,-1);
+    document.getElementById('kp-display').textContent = keypadState.buffer || '0';
+  };
+
+  window.kpConfirm = function() {
+    const val = parseFloat(keypadState.buffer);
+    if (isNaN(val) || val <= 0) { alert('Enter a valid number'); return; }
+    const { pid, key } = keypadState;
+    const readings = [...getMeasReadings(pid, key), val.toFixed(2)];
+    saveMeasReadings(pid, key, readings);
+    refreshMeasUI(pid, key);
+    closeKeypad();
+  };
+
+  window.saveNotesNow = function(pid) {
+    if (!activeCoach) return;
+    if (!scores[pid]) scores[pid] = {};
+    if (!scores[pid][activeCoach.id]) scores[pid][activeCoach.id] = {};
+    const nt = document.getElementById('my-notes');
+    if (nt) scores[pid][activeCoach.id].notes = nt.value;
+    saveScore(pid, activeCoach.id);
+  };
+
+  window.nextPlayer = function() {
+    const idx = players.findIndex(x => x.id === currentEvalPid);
+    if (idx < players.length-1) { currentEvalPid = players[idx+1].id; renderEvalForm(); }
+  };
+
+  // ── Aggregation ──────────────────────────────────────────────────────────
+  function aggAvg(pid) {
+    // Only include skills that have been scored; re-normalize weights to sum to 1
+    let weightedSum = 0, weightUsed = 0;
+    SK.forEach(k => {
+      const vals = coaches.map(c => scores[pid] && scores[pid][c.id] ? scores[pid][c.id][k] : null).filter(v => v);
+      if (!vals.length) return; // skip unscored skills entirely
+      const avg = vals.reduce((a,b) => a+b,0) / vals.length;
+      const w = WEIGHTS[k] || (1/SK.length);
+      weightedSum += avg * w;
+      weightUsed += w;
+    });
+    if (!weightUsed) return '—';
+    // Divide by weightUsed (not 1.0) so partial scoring still produces a fair number
+    return (weightedSum / weightUsed).toFixed(1);
+  }
+
+  function skillAgg(pid, key) {
+    const vals = coaches.map(c => scores[pid] && scores[pid][c.id] ? scores[pid][c.id][key] : null).filter(v => v);
+    if (!vals.length) return null;
+    return (vals.reduce((a,b) => a+b,0) / vals.length).toFixed(1);
+  }
+
+  function coachAvg(pid, cid) {
+    if (!scores[pid] || !scores[pid][cid]) return null;
+    const cs = scores[pid][cid];
+    // Use weighted avg, skipping unscored skills (same logic as aggAvg)
+    let wsum = 0, wused = 0;
+    SK.forEach(k => {
+      const v = cs[k];
+      if (!v) return;
+      const w = WEIGHTS[k] || (1/SK.length);
+      wsum += v * w; wused += w;
+    });
+    return wused ? (wsum / wused).toFixed(1) : null;
+  }
+
+  // ── Results ──────────────────────────────────────────────────────────────
+  function renderSummary() { /* stats cards removed */ }
+
+  window.sortResults = function(col) {
+    if (resSortCol === col) {
+      resSortDir = resSortDir === 'desc' ? 'asc' : 'desc';
+    } else {
+      resSortCol = col;
+      // Default direction: desc for scores/numbers, asc for text
+      resSortDir = ['name','pos','age'].includes(col) ? 'asc' : 'desc';
+    }
+    renderResults();
+  };
+
+  function renderResults() {
+    populateAgeDropdown('res-age');
+    const q    = (document.getElementById('res-srch').value || '').toLowerCase();
+    const pos  = document.getElementById('res-pos').value;
+    const age  = document.getElementById('res-age').value;
+    let list = players.filter(p =>
+      `${p.first} ${p.last} ${p.num} ${p.pos}`.toLowerCase().includes(q) &&
+      (!pos || p.pos === pos || p.pos2 === pos) &&
+      (!age || p.age === age)
+    );
+    // Column sort (overrides dropdown when a column header is clicked)
+    const dir = resSortDir === 'asc' ? 1 : -1;
+    if (resSortCol === 'avg') {
+      list.sort((a,b) => dir * ((parseFloat(aggAvg(b.id))||0) - (parseFloat(aggAvg(a.id))||0)) * -1);
+    } else if (resSortCol === 'fav') {
+      list.sort((a,b) => dir * (favCount(b.id) - favCount(a.id)) * -1);
+    } else if (resSortCol === 'num') {
+      list.sort((a,b) => dir * ((parseInt(a.num)||999) - (parseInt(b.num)||999)));
+    } else if (resSortCol === 'name') {
+      list.sort((a,b) => dir * `${a.last}${a.first}`.localeCompare(`${b.last}${b.first}`));
+    } else if (resSortCol === 'pos') {
+      list.sort((a,b) => dir * (a.pos||'').localeCompare(b.pos||''));
+    } else if (resSortCol === 'age') {
+      list.sort((a,b) => dir * (a.age||'').localeCompare(b.age||''));
+    } else if (SK.includes(resSortCol)) {
+      list.sort((a,b) => {
+        const va = parseFloat(skillAgg(a.id, resSortCol)) || 0;
+        const vb = parseFloat(skillAgg(b.id, resSortCol)) || 0;
+        return dir * (vb - va) * -1;
+      });
+    } else if (MEAS_FIELDS.some(m => m.key === resSortCol)) {
+      list.sort((a,b) => {
+        const getAvg = pid => {
+          const vals = coaches.map(c => {
+            if (!scores[pid] || !scores[pid][c.id]) return null;
+            const raw = scores[pid][c.id][resSortCol];
+            if (!raw) return null;
+            const arr = Array.isArray(raw) ? raw : [raw];
+            const nums = arr.map(r => parseFloat(r)).filter(n => !isNaN(n) && n > 0);
+            return nums.length ? nums.reduce((x,y)=>x+y,0)/nums.length : null;
+          }).filter(v => v !== null);
+          return vals.length ? vals.reduce((x,y)=>x+y,0)/vals.length : null;
+        };
+        const va = getAvg(a.id) || (resSortDir==='asc'?Infinity:-Infinity);
+        const vb = getAvg(b.id) || (resSortDir==='asc'?Infinity:-Infinity);
+        return dir * (vb - va) * -1;
+      });
+    } else {
+      // Coach column sort
+      const coach = coaches.find(c => c.id === resSortCol);
+      if (coach) {
+        list.sort((a,b) => {
+          const va = parseFloat(coachAvg(a.id, coach.id)) || 0;
+          const vb = parseFloat(coachAvg(b.id, coach.id)) || 0;
+          return dir * (vb - va) * -1;
+        });
+      }
+    }
+    // Also sync dropdown to match
+
+
+    const _mh = { speed30: '30yd', speed60: '60yd', pitchVelo: 'Velo', popTime: 'Pop' };
+    const thStyle = `cursor:pointer;user-select:none;white-space:nowrap;`;
+    const sortArrow = (col) => resSortCol === col ? (resSortDir === 'asc' ? ' ▲' : ' ▼') : '';
+    const th = (col, label, color='') =>
+      `<th style="${thStyle}${color?'color:'+color+';':''}" onclick="sortResults('${col}')" title="Click to sort">${label}${sortArrow(col)}</th>`;
+    document.getElementById('res-head').innerHTML = `<tr>
+      ${th('num','#')}${th('fav','★')}${th('name','Name')}${th('pos','Pos')}${th('age','Age Grp')}
+      ${SK.map((k,i) => th(k, SKILL_ABBR[i], '')).join('')}
+      ${th('avg','Overall')}
+      ${MEAS_FIELDS.map(m => th(m.key, _mh[m.key]||m.key)).join('')}
+      ${coaches.map(c => th(c.id, c.name.split(' ')[0], c.color)).join('')}
+      <th>Notes</th>
+    </tr>`;
+
+    const body = document.getElementById('res-body');
+    if (!list.length) { body.innerHTML = '<tr><td colspan="20" class="empty-td">No results.</td></tr>'; return; }
+
+    body.innerHTML = list.map(p => {
+      const avg  = aggAvg(p.id);
+      const avgN = parseFloat(avg) || 0;
+      const pc   = avg === '—' ? 'bgr' : avgN >= 7.5 ? 'bgn' : avgN >= 5 ? 'bam' : 'brd';
+
+      const skillCells = SK.map(key => {
+        const agg = skillAgg(p.id, key);
+        if (!agg) return '<td class="dim">—</td>';
+        const perCoach = coaches.map(c => {
+          const v = scores[p.id] && scores[p.id][c.id] ? scores[p.id][c.id][key] : null;
+          return v ? `<span style="color:${c.color};font-size:10px">${v}</span>` : null;
+        }).filter(Boolean).join('<span style="color:var(--txt3);font-size:9px">/</span>');
+        return `<td>
+          <span style="font-size:12px;font-weight:600;color:var(--txt)">${agg}</span>
+          ${coaches.length > 1 ? `<div class="per-coach">${perCoach}</div>` : ''}
+        </td>`;
+      }).join('');
+
+      const coachCells = coaches.map(c => {
+        const v = coachAvg(p.id, c.id);
+        const cFav = favorites.has(p.id) && favorites.get(p.id).has(c.id);
+        return `<td style="font-size:12px;color:${v ? c.color : '#999'};font-weight:${v?'500':'400'};white-space:nowrap">${v||'—'}${cFav?'<span style="color:#f5a623;margin-left:2px;font-size:11px">★</span>':''}</td>`;
+      }).join('');
+
+      const measCells = MEAS_FIELDS.map(m => {
+        const allNums = [];
+        coaches.forEach(c => {
+          if (!scores[p.id] || !scores[p.id][c.id]) return;
+          const raw = scores[p.id][c.id][m.key];
+          if (!raw) return;
+          const arr = Array.isArray(raw) ? raw : [raw];
+          arr.forEach(r => { const n = parseFloat(r); if (!isNaN(n) && n > 0) allNums.push(n); });
+        });
+        if (!allNums.length) return '<td class="dim">—</td>';
+        const isTime = m.unit === 'sec';
+        const best = isTime ? Math.min(...allNums) : Math.max(...allNums);
+        const avg  = allNums.reduce((a,b)=>a+b,0)/allNums.length;
+        const bestStr = m.key === 'pitchVelo' ? Math.round(best).toString() : best.toFixed(2);
+        const avgStr  = m.key === 'pitchVelo' ? Math.round(avg).toString()  : avg.toFixed(2);
+        return `<td style="text-align:center">
+          <div style="font-size:12px;font-weight:700;color:var(--txt)">${bestStr}</div>
+          ${allNums.length > 1 ? `<div style="font-size:10px;color:var(--txt3)">avg ${avgStr}</div>` : ''}
+        </td>`;
+      }).join('');
+
+      const notes = coaches.map(c => {
+        const n = scores[p.id] && scores[p.id][c.id] ? scores[p.id][c.id].notes : '';
+        return n ? `${c.name.split(' ').pop()}: ${n}` : null;
+      }).filter(Boolean).join(' | ');
+
+      return `<tr>
+        <td>${p.num||'—'}</td>
+        <td style="text-align:center;padding:4px 6px">
+        <div style="display:flex;align-items:center;justify-content:center;gap:2px">
+          <button onclick="toggleFavorite('${p.id}',event)" style="background:none;border:none;cursor:pointer;font-size:17px;padding:0;line-height:1;color:${isFavorited(p.id)?'#f5a623':'var(--txt3)'}">${isFavorited(p.id)?'★':'☆'}</button>
+          ${favCount(p.id)>0?`<span style="font-size:11px;font-weight:700;color:#f5a623">${favCount(p.id)}</span>`:''}
+        </div>
+      </td>
+      <td class="bold-cell">${p.first} ${p.last}</td>
+        <td>${[p.pos,p.pos2].filter(Boolean).join('/')||'—'}</td><td>${p.age||'—'}</td>
+        ${skillCells}
+        <td><span style="font-size:12px;font-weight:700;color:var(--txt)">${avg}</span></td>
+        ${measCells}
+        ${coachCells}
+        <td class="notes-cell" title="${notes}">${notes}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  // ── Export ───────────────────────────────────────────────────────────────
+  window.exportCSV = function() {
+    const rows = [['Tryout #','First','Last','DOB','Email','Age Group','Position',
+      ...SKILLS.map(s => s+' (avg)'),
+      'Overall (weighted)',
+      ...MEAS_FIELDS.map(m => m.label+' (avg)'),
+      ...coaches.flatMap(c => [c.name+' Overall', ...SKILLS.map(s => c.name+' '+s), ...MEAS_FIELDS.map(m => c.name+' '+m.label)]),
+      ...coaches.map(c => c.name+' Notes')
+    ]];
+    players.forEach(p => {
+      rows.push([p.num, p.first, p.last, p.dob||'', p.email||'', p.age, p.pos,
+        ...SK.map(k => skillAgg(p.id,k) || ''),
+        aggAvg(p.id),
+        ...MEAS_FIELDS.map(m => {
+          const vals = coaches.map(c => scores[p.id]&&scores[p.id][c.id]?parseFloat(scores[p.id][c.id][m.key])||null:null).filter(v=>v);
+          return vals.length ? (vals.reduce((a,b)=>a+b,0)/vals.length).toFixed(2) : '';
+        }),
+        ...coaches.flatMap(c => [
+          coachAvg(p.id,c.id) || '',
+          ...SK.map(k => scores[p.id] && scores[p.id][c.id] ? scores[p.id][c.id][k]||'' : ''),
+          ...MEAS_FIELDS.map(m => scores[p.id]&&scores[p.id][c.id]?scores[p.id][c.id][m.key]||'':'')
+        ]),
+        ...coaches.map(c => '"' + ((scores[p.id]&&scores[p.id][c.id]?scores[p.id][c.id].notes:'')||'').replace(/"/g,'""') + '"')
+      ]);
+    });
+    const csv = rows.map(r => r.join(',')).join('\n');
+    const a = document.createElement('a');
+    a.href = 'data:text/csv;charset=utf-8,' + encodeURIComponent(csv);
+    a.download = 'tryout_results.csv';
+    a.click();
+  };
+
+  // ── Tabs ─────────────────────────────────────────────────────────────────
+  window.gotoTab = function(t) {
+    document.querySelectorAll('.tab').forEach((b,i) => b.classList.toggle('active', ['roster','results'][i] === t));
+    document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+    document.getElementById('tab-'+t).classList.add('active');
+    if (t === 'roster')  { closeEval(); renderRoster(); }
+    if (t === 'results') { renderSummary(); renderResults(); }
+  };
+
+  window.renderRoster       = renderRoster;
+  window.renderEvalPicker   = renderEvalPicker;
+  window.renderResults      = renderResults;
+  window.renderSummary      = renderSummary;
+
+  // ── Password gate ────────────────────────────────────────────────────────
+  const CORRECT_PASSWORD = 'Baseball1!';
+
+  window.checkPassword = function() {
+    const val = document.getElementById('pw-input').value;
+    if (val === CORRECT_PASSWORD) {
+      document.getElementById('screen-password').style.display = 'none';
+      loadAll();
+    } else {
+      document.getElementById('pw-error').style.display = 'block';
+      document.getElementById('pw-input').value = '';
+      document.getElementById('pw-input').focus();
+    }
+  };
+
+  // ── Boot ─────────────────────────────────────────────────────────────────
+  document.addEventListener('DOMContentLoaded', function() {
+    // Skip password, go straight to loading
+    document.getElementById('screen-password').style.display = 'none';
+    document.getElementById('screen-loading').style.display = 'flex';
+    document.getElementById('screen-login').style.display = 'none';
+    document.getElementById('screen-main').style.display = 'none';
+    loadAll();
+  });
+</script>
+
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --red: #1a56db; --red-d: #1245b5;
+    --bg: #ffffff; --bg2: #f7f8fa; --bg3: #f0f2f5;
+    --txt: #111; --txt2: #666; --txt3: #999;
+    --bdr: rgba(0,0,0,0.10); --bdr2: rgba(0,0,0,0.18);
+    --radius: 10px; --radius-sm: 7px;
+    --green-bg:#e8f5e9; --green-txt:#2e7d32;
+    --amber-bg:#fff8e1; --amber-txt:#f57f17;
+    --red-bg:#e8f0fe;   --red-txt:#1a56db;
+    --blue-bg:#e3f2fd;  --blue-txt:#1565c0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1a1a1a; --bg2: #252525; --bg3: #2e2e2e;
+      --txt: #f0f0f0; --txt2: #aaa; --txt3: #777;
+      --bdr: rgba(255,255,255,0.10); --bdr2: rgba(255,255,255,0.20);
+      --green-bg:#1b3a1f; --green-txt:#81c784;
+      --amber-bg:#3a2e00; --amber-txt:#ffd54f;
+      --red-bg:#3a0e1a;   --red-txt:#f48fb1;
+      --blue-bg:#0d2137;  --blue-txt:#64b5f6;
+    }
+  }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg3); color: var(--txt); min-height: 100vh; overscroll-behavior-y: none; }
+  html { overscroll-behavior-y: none; }
+  #app { max-width: 960px; margin: 0 auto; padding: 16px; }
+
+  /* Save indicator */
+  #save-ind { position: fixed; top: 12px; right: 12px; background: #1b5e20; color: #fff; font-size: 12px; padding: 5px 14px; border-radius: 20px; opacity: 0; transition: opacity .3s; z-index: 9999; pointer-events: none; }
+
+  /* Loading */
+  #screen-loading { display: flex; align-items: center; justify-content: center; min-height: 60vh; flex-direction: column; gap: 12px; }
+  .spinner { width: 32px; height: 32px; border: 3px solid var(--bdr); border-top-color: var(--red); border-radius: 50%; animation: spin .7s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Header */
+  .hdr { display: flex; align-items: center; justify-content: space-between; background: var(--bg); border-radius: var(--radius); padding: 14px 16px; margin-bottom: 12px; border: 0.5px solid var(--bdr); }
+  .hdr-l { display: flex; align-items: center; gap: 10px; }
+  .hdr-ico { width: 36px; height: 36px; background: var(--red); border-radius: 50%; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 17px; flex-shrink: 0; }
+  .hdr-title { font-size: 16px; font-weight: 600; color: var(--txt); }
+  .hdr-sub { font-size: 12px; color: var(--txt2); }
+  .hdr-r { display: flex; align-items: center; gap: 8px; }
+  .coach-pill { font-size: 12px; padding: 5px 10px; border-radius: 20px; background: var(--bg2); color: var(--txt); display: flex; align-items: center; gap: 6px; border: 0.5px solid var(--bdr); }
+  .coach-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--red); }
+
+  /* Tabs */
+  .tabs { display: flex; background: var(--bg2); border-radius: var(--radius-sm); overflow: hidden; margin-bottom: 12px; border: 0.5px solid var(--bdr); }
+  .tab { flex: 1; padding: 10px; font-size: 14px; font-weight: 500; cursor: pointer; color: var(--txt2); background: transparent; border: none; transition: all .15s; }
+  .tab.active { background: var(--bg); color: var(--txt); }
+  .section { display: none; } .section.active { display: block; }
+
+  /* Buttons */
+  .btn { padding: 8px 14px; font-size: 13px; border: 0.5px solid var(--bdr2); border-radius: var(--radius-sm); background: var(--bg); color: var(--txt); cursor: pointer; white-space: nowrap; font-weight: 500; }
+  .btn:hover { background: var(--bg2); }
+  .btn:active { transform: scale(0.97); }
+  .btn.pri { background: var(--red); color: #fff; border-color: var(--red); }
+  .btn.pri:hover { background: var(--red-d); }
+  .btn.sm { padding: 5px 10px; font-size: 12px; }
+  .btn.del { color: var(--txt3); }
+
+  /* Toolbar */
+  .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+  .toolbar input[type=text], .toolbar select { padding: 8px 10px; font-size: 13px; border: 0.5px solid var(--bdr2); border-radius: var(--radius-sm); background: var(--bg); color: var(--txt); }
+  .toolbar input[type=text] { flex: 1; min-width: 140px; }
+
+  /* Badges */
+  .badge { display: inline-block; padding: 3px 9px; border-radius: 20px; font-size: 11px; font-weight: 600; }
+  .bgn { background: var(--green-bg); color: var(--green-txt); }
+  .bam { background: var(--amber-bg); color: var(--amber-txt); }
+  .brd { background: var(--red-bg); color: var(--red-txt); }
+  .bbl { background: var(--blue-bg); color: var(--blue-txt); }
+  .bgr { background: var(--bg3); color: var(--txt3); }
+
+  /* Player rows */
+  .pgrid { display: flex; flex-direction: column; gap: 6px; }
+  .prow { display: grid; grid-template-columns: 36px 1fr auto auto auto; gap: 10px; align-items: center; padding: 10px 14px; background: var(--bg); border: 0.5px solid var(--bdr); border-radius: var(--radius-sm); }
+  .prow:hover { border-color: var(--bdr2); }
+  .pnum { font-size: 13px; font-weight: 600; color: var(--txt2); text-align: center; }
+  .pname { font-size: 14px; font-weight: 600; color: var(--txt); }
+  .pmeta { font-size: 11px; color: var(--txt2); margin-top: 1px; }
+  .pbadges { display: flex; flex-direction: column; gap: 3px; }
+  .pavg { font-size: 14px; font-weight: 600; color: var(--txt); min-width: 28px; text-align: right; }
+  .pactions { display: flex; gap: 4px; }
+
+  /* Add form */
+  .add-form { background: var(--bg2); border-radius: var(--radius); padding: 14px; margin-bottom: 12px; border: 0.5px solid var(--bdr); }
+  .frow { display: grid; gap: 8px; margin-bottom: 8px; }
+  .c4 { grid-template-columns: 1fr 1fr 1fr 1fr; }
+  .c3 { grid-template-columns: 1fr 1fr 1fr; }
+  .fg label { font-size: 11px; color: var(--txt2); display: block; margin-bottom: 3px; }
+  .fg input, .fg select { width: 100%; padding: 7px 9px; font-size: 13px; border: 0.5px solid var(--bdr2); border-radius: var(--radius-sm); background: var(--bg); color: var(--txt); }
+
+  /* Eval card */
+  .eval-card { background: var(--bg); border: 0.5px solid var(--bdr); border-radius: var(--radius); padding: 16px; }
+  .eval-hdr { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 14px; padding-bottom: 12px; border-bottom: 0.5px solid var(--bdr); }
+  .eval-pname { font-size: 18px; font-weight: 700; color: var(--txt); }
+  .eval-meta { font-size: 12px; color: var(--txt2); margin-top: 3px; }
+  .eval-coach-lbl { font-size: 12px; font-weight: 600; margin-top: 6px; }
+  .eval-avg-block { text-align: right; }
+  .eval-avg-num { font-size: 26px; font-weight: 700; color: var(--txt); }
+  .eval-avg-sub { font-size: 11px; color: var(--txt2); }
+  .skill-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 14px; }
+  .skill-item {}
+  .slbl { font-size: 12px; color: var(--txt2); margin-bottom: 6px; display: flex; justify-content: space-between; align-items: center; }
+  .sval { font-size: 13px; font-weight: 600; color: var(--txt); }
+  .strack { display: flex; gap: 5px; flex-wrap: wrap; }
+  .sc { width: 72px; height: 72px; border-radius: 8px; display: flex; align-items: center; justify-content: center; cursor: pointer; font-size: 22px; font-weight: 700; background: var(--bg2); border: 0.5px solid var(--bdr); color: var(--txt2); user-select: none; -webkit-tap-highlight-color: transparent; }
+  .sc.on { background: var(--red); border-color: var(--red-d); color: #fff; }
+  .sc:active { transform: scale(0.93); }
+  .notes-wrap { margin-bottom: 4px; }
+  .notes-lbl { font-size: 12px; color: var(--txt2); display: block; margin-bottom: 4px; }
+  .notes-ta { width: 100%; padding: 9px; font-size: 13px; border: 0.5px solid var(--bdr2); border-radius: var(--radius-sm); background: var(--bg2); color: var(--txt); resize: vertical; min-height: 64px; font-family: inherit; }
+  .divider { border: none; border-top: 0.5px solid var(--bdr); margin: 12px 0; }
+  .other-title { font-size: 12px; font-weight: 600; color: var(--txt2); margin-bottom: 8px; }
+  .other-row { display: flex; gap: 8px; align-items: flex-start; padding: 6px 0; border-bottom: 0.5px solid var(--bdr); flex-wrap: wrap; }
+  .other-name { font-size: 12px; font-weight: 600; min-width: 110px; }
+  .other-avg { font-weight: 400; color: var(--txt2); }
+  .other-pills { display: flex; gap: 4px; flex-wrap: wrap; }
+  .cpill { font-size: 11px; padding: 2px 7px; border-radius: 4px; font-weight: 500; }
+  .eval-nav { display: flex; justify-content: space-between; align-items: center; margin-top: 14px; }
+  .eval-nav-r { display: flex; gap: 8px; align-items: center; }
+  .eval-prog { font-size: 12px; color: var(--txt2); }
+
+  /* Summary stats */
+  .stats-row { display: grid; grid-template-columns: repeat(4,1fr); gap: 10px; margin-bottom: 14px; }
+  .stat { background: var(--bg); border-radius: var(--radius-sm); padding: 12px 14px; border: 0.5px solid var(--bdr); }
+  .stat-val { font-size: 24px; font-weight: 700; color: var(--txt); }
+  .stat-lbl { font-size: 11px; color: var(--txt2); margin-top: 2px; }
+
+  /* Results table */
+  .rtable { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .rtable th { text-align: left; padding: 8px 8px; font-size: 11px; font-weight: 600; color: var(--txt2); border-bottom: 1px solid var(--bdr); background: var(--bg2); white-space: nowrap; position: sticky; top: 0; z-index: 1; }
+  .rtable td { padding: 8px 8px; border-bottom: 0.5px solid var(--bdr); color: var(--txt); vertical-align: middle; }
+  .rtable tr:hover td { background: var(--bg2); }
+  .spill { padding: 2px 7px; border-radius: 20px; font-size: 11px; font-weight: 600; }
+  .per-coach { margin-top: 2px; display: flex; gap: 2px; align-items: center; }
+  .bold-cell { font-weight: 600; white-space: nowrap; }
+  .notes-cell { max-width: 150px; font-size: 11px; color: var(--txt2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .dim { color: var(--txt3) !important; }
+  .empty-td { text-align: center; padding: 2rem; color: var(--txt2); }
+
+  /* Login */
+  .login-wrap { display: flex; align-items: center; justify-content: center; min-height: 80vh; padding: 16px; }
+  .login-card { background: var(--bg); border-radius: var(--radius); border: 0.5px solid var(--bdr); padding: 24px; width: 100%; max-width: 400px; }
+  .login-title { font-size: 20px; font-weight: 700; color: var(--txt); margin-bottom: 4px; }
+  .login-sub { font-size: 13px; color: var(--txt2); margin-bottom: 16px; }
+  .coach-btn { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border: 0.5px solid var(--bdr2); border-radius: var(--radius-sm); background: var(--bg); cursor: pointer; text-align: left; width: 100%; margin-bottom: 8px; }
+  .coach-btn:hover { background: var(--bg2); }
+  .coach-btn:active { transform: scale(0.98); }
+  .cavatar { width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 14px; font-weight: 700; flex-shrink: 0; }
+  .coach-btn-name { font-size: 15px; font-weight: 600; color: var(--txt); }
+  .coach-btn-role { font-size: 11px; color: var(--txt2); }
+  .new-coach-row { display: flex; gap: 8px; margin-top: 4px; }
+  .new-coach-row input { flex: 1; padding: 8px 10px; font-size: 13px; border: 0.5px solid var(--bdr2); border-radius: var(--radius-sm); background: var(--bg); color: var(--txt); }
+
+  .empty { text-align: center; padding: 2rem; color: var(--txt2); font-size: 14px; }
+  .meas-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 4px; }
+  .meas-item {}
+  .meas-input { width: 100%; padding: 8px 10px; font-size: 15px; font-weight: 600; border: 0.5px solid var(--bdr2); border-radius: var(--radius-sm); background: var(--bg); color: var(--txt); text-align: center; }
+  .meas-input:focus { outline: none; border-color: var(--red); }
+  .timer-display { font-size: 28px; font-weight: 700; color: var(--txt); text-align: center; letter-spacing: 1px; padding: 8px 0 6px; font-variant-numeric: tabular-nums; }
+  .timer-btns { display: flex; gap: 6px; }
+  .timer-btn { flex: 1; padding: 28px 0; font-size: 16px; font-weight: 600; border-radius: var(--radius-sm); border: none; cursor: pointer; transition: all .1s; }
+  .timer-btn:active { transform: scale(0.96); }
+  .timer-start { background: #1b5e20; color: #fff; }
+  .timer-start:hover { background: #2e7d32; }
+  .timer-stop  { background: var(--red); color: #fff; }
+  .timer-stop:hover  { background: var(--red-d); }
+  .timer-reset { background: var(--bg2); color: var(--txt2); border: 0.5px solid var(--bdr2) !important; flex: 0 0 72px; }
+  .timer-reset:hover { background: var(--bg3); }
+  @media (max-width: 600px) { .meas-grid { grid-template-columns: 1fr 1fr; } }
+  .mread-list { margin-top:6px;display:flex;flex-direction:column;gap:3px;min-height:20px }
+  .mread-row { display:flex;align-items:center;justify-content:space-between;padding:4px 8px;background:var(--bg2);border-radius:var(--radius-sm);border:0.5px solid var(--bdr) }
+  .mread-val { font-size:13px;font-weight:600;color:var(--txt) }
+  .mread-del { background:none;border:none;color:var(--txt3);cursor:pointer;font-size:13px;padding:0 2px;line-height:1 }
+  .mread-del:hover { color:var(--red) }
+  .mread-avg { font-size:11px;font-weight:600;color:var(--txt2);margin-top:4px;text-align:right }
+  .kp-btn { padding:14px;font-size:18px;font-weight:600;border:0.5px solid var(--bdr2);border-radius:var(--radius-sm);background:var(--bg2);color:var(--txt);cursor:pointer }
+  .kp-btn:hover { background:var(--bg3) }
+  .kp-btn:active { transform:scale(0.95) }
+  .kp-del { background:var(--bg3);color:var(--txt2) }
+
+  /* Mobile tweaks */
+  @media (max-width: 600px) {
+    .skill-grid { grid-template-columns: 1fr; }
+    .frow.c4 { grid-template-columns: 1fr 1fr; }
+    .frow.c3 { grid-template-columns: 1fr 1fr; }
+    .stats-row { grid-template-columns: 1fr 1fr; }
+    .prow { grid-template-columns: 30px 1fr auto auto; }
+    .pbadges { display: none; }
+    .sc { width: 26px; height: 26px; font-size: 11px; }
+  }
+</style>
+</head>
+<body>
+<div id="save-ind">✓ Saved</div>
+
+<!-- Edit Player Modal -->
+<div id="edit-modal-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:9000;align-items:center;justify-content:center;padding:16px">
+  <div style="background:var(--bg);border-radius:var(--radius);padding:20px;width:100%;max-width:560px;max-height:90vh;overflow-y:auto">
+    <div id="edit-modal-body"></div>
+  </div>
+</div>
+
+<!-- Keypad Modal -->
+<div id="kp-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:9000;align-items:center;justify-content:center;padding:16px">
+  <div style="background:var(--bg);border-radius:var(--radius);padding:20px;width:100%;max-width:320px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <div style="font-size:14px;font-weight:600;color:var(--txt)" id="kp-title">Enter value</div>
+      <button class="btn sm del" onclick="closeKeypad()" style="font-size:16px;padding:2px 8px">✕</button>
+    </div>
+    <div id="kp-display" style="font-size:32px;font-weight:700;color:var(--txt);text-align:center;padding:12px 0;border-bottom:0.5px solid var(--bdr);margin-bottom:12px;letter-spacing:1px;min-height:56px">0</div>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:8px">
+      <button class="kp-btn" onclick="kpPress('7')">7</button>
+      <button class="kp-btn" onclick="kpPress('8')">8</button>
+      <button class="kp-btn" onclick="kpPress('9')">9</button>
+      <button class="kp-btn" onclick="kpPress('4')">4</button>
+      <button class="kp-btn" onclick="kpPress('5')">5</button>
+      <button class="kp-btn" onclick="kpPress('6')">6</button>
+      <button class="kp-btn" onclick="kpPress('1')">1</button>
+      <button class="kp-btn" onclick="kpPress('2')">2</button>
+      <button class="kp-btn" onclick="kpPress('3')">3</button>
+      <button class="kp-btn" onclick="kpPress('.')">.</button>
+      <button class="kp-btn" onclick="kpPress('0')">0</button>
+      <button class="kp-btn kp-del" onclick="kpBackspace()">⌫</button>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+      <button class="btn" onclick="closeKeypad()">Cancel</button>
+      <button class="btn pri" onclick="kpConfirm()">Add reading</button>
+    </div>
+  </div>
+</div>
+
+<!-- Player Index Drawer -->
+<div id="player-drawer" style="display:none;position:fixed;inset:0;z-index:8000">
+  <div id="drawer-backdrop" onclick="closeDrawer()" style="position:absolute;inset:0;background:rgba(0,0,0,0.4)"></div>
+  <div id="drawer-panel" style="position:absolute;left:0;top:0;bottom:0;width:280px;max-width:85vw;background:var(--bg);display:flex;flex-direction:column;transform:translateX(-100%);transition:transform .25s ease">
+    <div style="padding:10px 14px;border-bottom:0.5px solid var(--bdr);display:flex;flex-direction:column;gap:8px;flex-shrink:0">
+      <div style="display:flex;align-items:center;justify-content:space-between">
+        <div style="font-size:15px;font-weight:600;color:var(--txt)">Players</div>
+        <button onclick="closeDrawer()" style="background:none;border:none;font-size:20px;color:var(--txt2);cursor:pointer;padding:0 4px">✕</button>
+      </div>
+      <div style="display:flex;gap:6px;align-items:center">
+        <select id="drawer-sort" onchange="renderDrawer()" style="flex:1;padding:6px 8px;font-size:12px;border:0.5px solid var(--bdr2);border-radius:var(--radius-sm);background:var(--bg2);color:var(--txt)">
+          <option value="tryout">By Tryout #</option>
+          <option value="name">By Name</option>
+          <option value="age">By Age</option>
+        </select>
+        <div style="position:relative" id="drawer-age-wrap">
+          <button id="drawer-age-btn" onclick="toggleDrawerAgeMenu(event)" style="padding:6px 10px;font-size:12px;border:0.5px solid var(--bdr2);border-radius:var(--radius-sm);background:var(--bg2);color:var(--txt);cursor:pointer;white-space:nowrap">Ages ▾</button>
+        </div>
+      </div>
+    </div>
+    <div id="drawer-age-menu" style="display:none;position:absolute;top:0;left:0;background:var(--bg);border:0.5px solid var(--bdr2);border-radius:var(--radius-sm);z-index:9999;padding:8px 4px;min-width:140px;box-shadow:0 4px 16px rgba(0,0,0,0.2)"></div>
+    <div id="drawer-list" style="overflow-y:auto;flex:1"></div>
+  </div>
+</div>
+
+<!-- Photo Lightbox -->
+<div id="photo-lightbox" onclick="closeLightbox()" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.88);z-index:9500;align-items:center;justify-content:center;flex-direction:column;gap:16px">
+  <img id="lightbox-img" style="max-width:90vw;max-height:75vh;border-radius:var(--radius);object-fit:contain">
+  <div style="display:flex;gap:12px">
+    <button onclick="event.stopPropagation();closeLightbox()" style="padding:10px 20px;border-radius:20px;background:rgba(255,255,255,0.15);color:#fff;border:none;font-size:14px;cursor:pointer">Close</button>
+  </div>
+</div>
+
+<div id="app">
+
+  <!-- Password Gate -->
+  <div id="screen-password">
+    <div class="login-wrap">
+      <div class="login-card" style="max-width:360px">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:20px">
+          <div class="hdr-ico" style="overflow:hidden;padding:0"><img src="data:image/jpeg;base64,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" style="width:100%;height:100%;object-fit:cover;border-radius:50%"></div>
+          <div>
+            <div class="login-title">Tryout App</div>
+            <div class="login-sub" style="margin:0">Ninth Inning Baseball</div>
+          </div>
+        </div>
+        <hr style="border:none;border-top:0.5px solid var(--bdr);margin-bottom:20px">
+        <div class="fg" style="margin-bottom:14px">
+          <label style="font-size:12px;color:var(--txt2);display:block;margin-bottom:6px">Enter password to continue</label>
+          <input type="password" id="pw-input" placeholder="Password"
+            style="width:100%;padding:10px 12px;font-size:15px;border:0.5px solid var(--bdr2);border-radius:var(--radius-sm);background:var(--bg);color:var(--txt);"
+            onkeydown="if(event.key==='Enter')checkPassword()">
+        </div>
+        <div id="pw-error" style="display:none;color:#c8102e;font-size:12px;margin-bottom:10px">Incorrect password. Try again.</div>
+        <button class="btn pri" style="width:100%;padding:10px;font-size:15px" onclick="checkPassword()">Enter</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Loading -->
+  <div id="screen-loading" style="display:none">
+    <div class="spinner"></div>
+    <div id="loading-msg" style="font-size:14px;color:#888">Connecting to database...</div>
+  </div>
+
+  <!-- Login -->
+  <div id="screen-login" style="display:none">
+    <div class="login-wrap">
+      <div class="login-card">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
+          <div class="hdr-ico" style="overflow:hidden;padding:0"><img src="data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAUDBAQEAwUEBAQFBQUGBwwIBwcHBw8LCwkMEQ8SEhEPERETFhwXExQaFRERGCEYGh0dHx8fExciJCIeJBweHx7/2wBDAQUFBQcGBw4ICA4eFBEUHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh7/wAARCABAAEADASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD5IijbHccZPHQetdd4Ut8LG2AeM7dvUcdP1rloAvGWU4wep+b2/wDr12GgYRIvmG8AFcsevHyn9PpVxJZ1WnrtCOiiQxAsP3XDjjjn/PPvV+0dk8tn/eCNN65hA3525Ht/XNY1lLCdmx0QYygZ2Pzcfn9frXS+CX8OzXEdlfwNK1xKq2zxTMFVyACDyC2TjnHrWlySrJIVCfu1Yqu5cQ/fHHy+2PSs66WRAESPhYw4/cj5s7ePbt9c+9dH41Ph+xlOm6ZayxXUEvzSvMzLnAyoycnqOfY1ydw8WF/0iEttG35mOX4zj1+vbB9qLjOY8TwbouEH+rByExgcVyEiHGcds9O3rXa62CYiGkU4QFvnJyePl9/6fhXHzADcNw45PPX2rORSC26r1AyNvzDg966/RZSsUe0OFGMHcF2txz7f/WrkrQEsMjjAz8o4HFdPpe4KhwBhBkBP4eP8/j70ITOhsrzyZ4ppLZJljIZoZZAFzxjOCCPw9PY16XNommmbTtU0ezW3nguYDdxRNnG7yzuOemMg8dR9K8piLnYobkqBnYANvH5f1z716fpV9LpPj4adJPA9ve2kAYr0DiNVX6E4wPUMKoRWa4spvHesWl9psVyhaWTfJJgxlEB4wRgEj9PavP8AU7qGd5pzbC2ik2sYopfli4HI7jp/nFehy6dcxfEm78ySFEuLSadGZMAo0e3APYg9fb615rMZQMbVcIg5CgAj5cAeg6fXj3oAz9SlBjGN4woC5KjDcZPsPauSuTyQNwAPy5I4PGfp9K6nUN2wjYB+7GcJ91eP1Pv6+9cvd7t7ZGCQMgL0HGKljQltt3r0OOeh5PHH/wBet/TXQCMZXOMjqcnj5fft+tc/buABgH0HzYweOf8AP9K2rBvkQA4B4BL42txyfT/63tQhs2IHjMRxtB2koNpPPHH09/rXYXxjT4gacBtHFmV4PJ2RcD1//XXG6bfNaXMVz5cLsp+VZiGQNxyy9D/L8q6TT/EF3r/ivSPtsVusqXMagxoEbqoBYjr049PwpiPSbu6sNWk1IEIL3RzOqHB5DRkfiDnn0IrxSUxYQq6t+7BX5CctxnHsPX2+ldN4o1S60rx3q81pIEaVnidWk4IZVyWH48Y6YHpXITXESpgIQNoTmX7pGPmOO5/IfhQBWvGXaAHQjYG4ycnj5ff/APXWBcYJb5gT17nJ9K2bplKDbuHAUZfGG45Pp7VizkYJOeTgZboeMk0mNCRbgueeg3YA6cY//VWpZO21eo+QBsKPuccj/PNY0bAAZ/lVu3mUY5yRz0PJ44pIDdjZ8fMzDCDdgKPl4wB6duO/510XhHxPP4fabZpttdSPtbzZl+eNQAMLj7vUcVxcVwuFxjjkfLnnjipY7hAFA5GOAV6nj9KdxHbeKvFlzr9okdxplrbyJh2miA3smAAuTyByDj6Vys7zBW5bO1d3Cj5eMD27cf8A16qfaE4wQeMj5ScnjioHnTA5zgcYXvxn8KAJLh3KcjH7sA4QDCcYI+v61mT7sHd6DPA6cYqWaZSOueOpB5PHFVJHBHb8qTGf/9k=" style="width:100%;height:100%;object-fit:cover;border-radius:50%"></div>
+          <div>
+            <div class="login-title">Tryout App</div>
+            <div class="login-sub">Select your coach profile to begin</div>
+          </div>
+        </div>
+        <hr style="border:none;border-top:0.5px solid var(--bdr);margin-bottom:16px">
+        <div id="coach-list"></div>
+        <div class="new-coach-row">
+          <input type="text" id="new-coach-input" placeholder="Add new coach name...">
+          <button class="btn pri" onclick="addCoach()">Add</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Main App -->
+  <div id="screen-main" style="display:none">
+    <div class="hdr">
+      <div class="hdr-l">
+        <div class="hdr-ico" style="overflow:hidden;padding:0"><img src="data:image/jpeg;base64,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" style="width:100%;height:100%;object-fit:cover;border-radius:50%"></div>
+        <div>
+          <div class="hdr-title">Tryout App</div>
+          <div class="hdr-sub" id="hdr-sub">Baseball Assessment</div>
+        </div>
+      </div>
+      <div class="hdr-r">
+        <div class="coach-pill">
+          <div class="coach-dot" id="coach-dot"></div>
+          <span id="coach-label">Coach</span>
+        </div>
+        <button class="btn sm" onclick="switchCoach()">Switch</button>
+      </div>
+    </div>
+
+    <div class="tabs">
+      <button class="tab active" onclick="gotoTab('roster')">Roster</button>
+      <button class="tab" onclick="gotoTab('results')">Results</button>
+    </div>
+
+    <!-- Roster -->
+    <div id="tab-roster" class="section active">
+      <div class="toolbar">
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px;color:var(--txt);white-space:nowrap;padding:7px 10px;border:0.5px solid var(--bdr2);border-radius:var(--radius-sm);background:var(--bg)">
+          <input type="checkbox" id="select-all-cb" onchange="toggleSelectAll(this.checked)" style="width:16px;height:16px;cursor:pointer"> All
+        </label>
+        <input type="text" id="r-srch" placeholder="Search by name..." oninput="renderRoster()" style="min-width:120px">
+        <select id="r-age" onchange="renderRoster()" style="padding:8px 10px;font-size:13px;border:0.5px solid var(--bdr2);border-radius:var(--radius-sm);background:var(--bg);color:var(--txt)">
+          <option value="">All ages</option>
+        </select>
+        <select id="r-sort" onchange="renderRoster()" style="padding:8px 10px;font-size:13px;border:0.5px solid var(--bdr2);border-radius:var(--radius-sm);background:var(--bg);color:var(--txt)">
+          <option value="tryout">Sort: Tryout #</option>
+          <option value="name">Sort: Name</option>
+
+        </select>
+        <button class="btn" onclick="document.getElementById('csv-inp').click()">⬆ Import CSV</button>
+        <input type="file" id="csv-inp" accept=".csv" style="display:none" onchange="importCSV(event)">
+        <button class="btn" onclick="removeDuplicates()" style="color:#c62828;border-color:#c62828">Delete Duplicates</button>
+        <button class="btn" onclick="toggleAddForm()">+ Add player</button>
+      </div>
+      <div id="add-form" style="display:none" class="add-form">
+        <div style="display:flex;gap:12px;align-items:flex-start;margin-bottom:10px">
+          <div style="flex-shrink:0">
+            <div id="add-photo-preview" style="width:72px;height:72px;border-radius:var(--radius);background:var(--bg2);border:0.5px solid var(--bdr2);display:flex;align-items:center;justify-content:center;font-size:28px;overflow:hidden;cursor:pointer" onclick="document.getElementById('add-photo-inp').click()">📷</div>
+            <input type="file" id="add-photo-inp" accept="image/*" capture="environment" style="display:none" onchange="previewAddPhoto(event)">
+            <div style="font-size:10px;color:var(--txt3);text-align:center;margin-top:3px">Tap for photo</div>
+          </div>
+          <div style="flex:1">
+        <div class="frow c4">
+          <div class="fg"><label>First name</label><input id="ff" type="text" placeholder="First"></div>
+          <div class="fg"><label>Last name</label><input id="fl" type="text" placeholder="Last"></div>
+          <div class="fg"><label>Date of birth</label><input id="fdob" type="date" style="width:100%;padding:6px 8px;font-size:13px;border:0.5px solid var(--bdr2);border-radius:var(--radius-sm);background:var(--bg);color:var(--txt)"></div>
+          <div class="fg"><label>Email</label><input id="femail" type="email" placeholder="player@email.com"></div>
+        </div>
+        <div class="frow c4">
+          <div class="fg"><label>Age group</label>
+            <select id="fa" style="width:100%;padding:6px 8px;font-size:13px;border:0.5px solid var(--bdr2);border-radius:var(--radius-sm);background:var(--bg);color:var(--txt)">
+              <option value="">Select...</option>
+              <option>7U</option><option>8U</option><option>9U</option><option>10U</option>
+              <option>11U</option><option>12U</option><option>13U</option><option>14U</option>
+              <option>15U</option><option>16U</option><option>17U</option><option>18U</option>
+            </select>
+          </div>
+          <div class="fg"><label>Tryout number</label><input id="fg2" type="text" placeholder="e.g. 42"></div>
+        </div>
+        <div class="frow c4">
+          <div class="fg"><label>Primary position</label>
+            <select id="fp"><option value="">Select...</option>
+              <option>Pitcher</option><option>Catcher</option><option>1B</option><option>2B</option><option>3B</option><option>SS</option><option>OF</option><option>INF</option><option>Utility</option><option>Unknown</option>
+            </select>
+          </div>
+          <div class="fg"><label>Secondary position</label>
+            <select id="fp2"><option value="">Select...</option>
+              <option>Pitcher</option><option>Catcher</option><option>1B</option><option>2B</option><option>3B</option><option>SS</option><option>OF</option><option>INF</option><option>Utility</option><option>Unknown</option>
+            </select>
+          </div>
+        </div>
+          </div><!-- end flex:1 -->
+        </div><!-- end photo+form row -->
+        <div style="display:flex;gap:8px">
+          <button class="btn pri" onclick="addPlayer()">Add player</button>
+          <button class="btn" onclick="toggleAddForm()">Cancel</button>
+        </div>
+      </div>
+      <!-- Bulk action bar — hidden until selections made -->
+      <div id="bulk-bar" style="display:none;align-items:center;gap:8px;padding:8px 12px;background:var(--blue-bg);border:0.5px solid var(--blue-txt);border-radius:var(--radius-sm);margin-bottom:8px;flex-wrap:wrap">
+        <span id="bulk-count" style="font-size:13px;font-weight:600;color:var(--blue-txt);flex:1">0 selected</span>
+        <select id="bulk-age-select" style="padding:6px 10px;font-size:13px;border:0.5px solid var(--bdr2);border-radius:var(--radius-sm);background:var(--bg);color:var(--txt)">
+          <option value="">Set age group...</option>
+          <option>7U</option><option>8U</option><option>9U</option><option>10U</option>
+          <option>11U</option><option>12U</option><option>13U</option><option>14U</option>
+          <option>15U</option><option>16U</option><option>17U</option><option>18U</option>
+        </select>
+        <button class="btn" onclick="bulkSetAge()" style="background:var(--bg);font-size:13px">Apply Age</button>
+        <button class="btn" onclick="bulkDelete()" style="color:#c62828;border-color:#c62828;font-size:13px">Delete Selected</button>
+        <button class="btn sm" onclick="clearSelection()" style="font-size:13px">✕ Clear</button>
+      </div>
+      <div id="roster-list" class="pgrid"></div>
+      <!-- Eval form overlays roster content -->
+      <div id="eval-form-wrap" style="display:none"></div>
+    </div>
+
+
+
+    <!-- Results -->
+    <div id="tab-results" class="section">
+
+      <div class="toolbar">
+        <input type="text" id="res-srch" placeholder="Filter by name..." oninput="renderResults()" style="min-width:120px">
+        <select id="res-age" onchange="renderResults()" style="padding:8px 10px;font-size:13px;border:0.5px solid var(--bdr2);border-radius:var(--radius-sm);background:var(--bg);color:var(--txt)">
+          <option value="">All ages</option>
+        </select>
+        <select id="res-pos" onchange="renderResults()" style="padding:8px 10px;font-size:13px;border:0.5px solid var(--bdr2);border-radius:var(--radius-sm);background:var(--bg);color:var(--txt)">
+          <option value="">All positions</option>
+          <option>Pitcher</option><option>Catcher</option><option>1B</option><option>2B</option><option>3B</option><option>SS</option><option>OF</option><option>INF</option><option>Utility</option>
+        </select>
+        
+        <button class="btn pri" onclick="exportCSV()">⬇ Export CSV</button>
+      </div>
+      <div id="results-scroll-wrap" style="overflow-x:auto;overflow-y:auto;max-height:calc(100vh - 320px);border:0.5px solid var(--bdr);border-radius:var(--radius-sm)">
+        <table class="rtable" style="min-width:900px">
+          <thead id="res-head" style="position:sticky;top:0;z-index:2"></thead>
+          <tbody id="res-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>
